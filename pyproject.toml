@@ -1,0 +1,17 @@
+[project]
+name = "quoridor-bot"
+version = "0.1.0"
+description = "Quoridor bot (offline)"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = ["test.py"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
