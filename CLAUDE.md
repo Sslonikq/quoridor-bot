@@ -19,10 +19,13 @@
 ## Команды
 ```bash
 pytest -q                 # все тесты
+pytest -q -m "not slow"  # быстрый прогон без медленных тестов (матчи, subprocess)
 pytest tests/rules -q     # только правила
 ruff check . && ruff format .
 python -m quoridor.cli    # играть против бота в консоли
 python -m quoridor.arena --games 100 --a v2 --b v1   # матч версий бота
+# флаги арены: --seed N (по умолчанию 0), --max-moves N (лимит полуходов, по умолчанию 300; «D» = лимит, ничьих в игре нет), --quiet (без прогресса по партиям)
+# --a/--b: имена из реестра BOTS в quoridor/bots.py (random, greedy, v1, v1-clock)
 ```
 
 ## Правила (источник истины)

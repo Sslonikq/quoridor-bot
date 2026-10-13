@@ -39,3 +39,11 @@ git commit -m "docs(agents): закрытие фазы 4, текущая фаз�
 
 ## Следующий шаг
 Фаза 5: ai-engineer (+rules-engineer для проверки стенки) — сначала minor/nits из 0025, затем профилирование и ускорение.
+
+## Дополнение: CLAUDE.md
+По решению пользователя в «Команды» добавлены `pytest -q -m "not slow"` и флаги арены (`--seed`, `--max-moves`, `--quiet`, имена ботов из `BOTS`). Git-команда обновлена ниже.
+
+```
+git add ROADMAP.md CLAUDE.md reports/0026-2026-10-14-main-phase4-close.md
+git commit -m "docs(agents): закрытие фазы 4, текущая фаза — 5" -m "- ревью фазы 4: APPROVE WITH NITS" -m "- ROADMAP: текущая фаза 5 (Скорость)" -m "- CLAUDE.md: pytest -m 'not slow' и флаги арены"
+```
