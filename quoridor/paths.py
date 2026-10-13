@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import deque
 
-from quoridor.state import GameState, goal_row, in_board
+from quoridor.state import Cell, GameState, goal_row, in_board
 
 DIRS = ((0, 1), (0, -1), (1, 0), (-1, 0))
 
@@ -27,6 +27,31 @@ def shortest_path_length(state: GameState, player: int) -> int | None:
                 return d + 1
             seen.add((nc, nr))
             queue.append(((nc, nr), d + 1))
+    return None
+
+
+def shortest_path(state: GameState, player: int) -> list[Cell] | None:
+    """One shortest path of cells from the pawn (inclusive) to the goal row, or None."""
+    start = state.pawns[player]
+    goal = goal_row(player)
+    if start[1] == goal:
+        return [start]
+    parent: dict[Cell, Cell | None] = {start: None}
+    queue = deque([start])
+    while queue:
+        cur = queue.popleft()
+        c, r = cur
+        for dc, dr in DIRS:
+            nxt = (c + dc, r + dr)
+            if not in_board(*nxt) or nxt in parent or state.blocked(c, r, dc, dr):
+                continue
+            parent[nxt] = cur
+            if nxt[1] == goal:
+                path = [nxt]
+                while (p := parent[path[-1]]) is not None:
+                    path.append(p)
+                return path[::-1]
+            queue.append(nxt)
     return None
 
 
