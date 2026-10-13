@@ -6,12 +6,11 @@ import argparse
 import sys
 from collections.abc import Callable, Sequence
 
-from quoridor.bots import Bot, GreedyBot, RandomBot
+from quoridor.bots import BOTS, DEFAULT_MAX_MOVES, Bot, make_bot
 from quoridor.notation import col_name, format_move, parse_move, row_name
 from quoridor.rules import apply_move, is_legal_move, legal_moves, winner
 from quoridor.state import BLACK, BOARD_SIZE, WHITE, GameState, PawnMove, WallMove
 
-DEFAULT_MAX_MOVES = 300
 PAWN_CHAR = ("W", "B")
 PLAYER_NAME = ("белые", "чёрные")
 HELP = "Ход: клетка (e2) или стенка (e3h / f3v). Команды: moves, help, quit."
@@ -128,7 +127,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="python -m quoridor.cli", description="Коридор: человек против бота"
     )
-    p.add_argument("--bot", choices=("random", "greedy"), default="greedy")
+    p.add_argument("--bot", choices=sorted(BOTS), default="greedy")
     p.add_argument("--color", choices=("white", "black"), default="white")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument(
@@ -142,7 +141,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     for stream in (sys.stdin, sys.stdout):  # Russian text on Windows consoles
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8")
-    bot: Bot = RandomBot(args.seed) if args.bot == "random" else GreedyBot(args.seed)
+    bot: Bot = make_bot(args.bot, args.seed)
     color = WHITE if args.color == "white" else BLACK
     try:
         play(input, print, bot=bot, human_color=color, max_moves=args.max_moves)

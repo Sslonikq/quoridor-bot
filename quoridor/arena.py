@@ -13,36 +13,76 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 
-from quoridor.bots import Bot, GreedyBot, RandomBot
+from quoridor.bots import (
+    BOTS,
+    DEFAULT_MAX_MOVES,
+    NEAR_DETERMINISTIC,
+    Bot,
+    BotFactory,
+    UnknownBotError,
+    make_bot,
+)
 from quoridor.notation import format_move
 from quoridor.rules import apply_move, winner
 from quoridor.state import BLACK, WHITE, GameState
 
-DEFAULT_MAX_MOVES = 300
-BotFactory = Callable[[int], Bot]
+__all__ = [
+    # re-exported from quoridor.bots (the registry lives there)
+    "BOTS",
+    "DEFAULT_MAX_MOVES",
+    "NEAR_DETERMINISTIC",
+    "Bot",
+    "BotFactory",
+    "UnknownBotError",
+    "make_bot",
+    # arena
+    "EXIT_INTERRUPTED",
+    "GameError",
+    "GameResult",
+    "MatchResult",
+    "Tally",
+    "build_parser",
+    "format_report",
+    "game_seed",
+    "main",
+    "play_game",
+    "run_match",
+    "wilson_interval",
+]
 
-# Registry: name -> factory(seed). A new bot version is added with one line.
-BOTS: dict[str, BotFactory] = {
-    "random": RandomBot,
-    "greedy": GreedyBot,
-}
-# Bots whose play does not depend on the seed in a meaningful way (seed only breaks ties):
-# a mirror match of such a bot repeats the same game.
-NEAR_DETERMINISTIC = frozenset({"greedy"})
+EXIT_INTERRUPTED = 130
 
 
-class UnknownBotError(ValueError):
-    """Bot name is not in the registry."""
+class GameError(RuntimeError):
+    """A bot crashed or made an illegal move. Carries everything needed to replay the game."""
 
+    def __init__(
+        self,
+        index: int,
+        seed: int | None,
+        a_color: int,
+        side: int,
+        moves: Sequence[str],
+        cause: BaseException,
+    ) -> None:
+        self.index = index
+        self.seed = seed
+        self.a_color = a_color
+        self.side = side  # colour of the side that failed
+        self.moves = tuple(moves)  # moves played before the failure
+        self.cause = cause
+        super().__init__(self.describe())
 
-def make_bot(name: str, seed: int, registry: Mapping[str, BotFactory] | None = None) -> Bot:
-    reg = BOTS if registry is None else registry
-    try:
-        factory = reg[name]
-    except KeyError:
-        known = ", ".join(sorted(reg))
-        raise UnknownBotError(f"неизвестный бот {name!r}. Доступны: {known}") from None
-    return factory(seed)
+    def describe(self) -> str:
+        names = ("белые", "чёрные")
+        a_side = "A" if self.side == self.a_color else "B"
+        log = " ".join(self.moves) if self.moves else "(пусто)"
+        return (
+            f"партия {self.index + 1}, seed партии {self.seed}: ошибка бота {a_side} "
+            f"({names[self.side]}), ход №{len(self.moves) + 1}: "
+            f"{type(self.cause).__name__}: {self.cause}\n"
+            f"A играет {names[self.a_color]}. Уже сыграно: {log}"
+        )
 
 
 def game_seed(base_seed: int, index: int) -> int:
@@ -120,6 +160,12 @@ class MatchResult:
         return self.total.wins / n if n else 0.0
 
     @property
+    def score(self) -> float:
+        """(W + D/2) / n: draws count as half a win."""
+        n = len(self.games)
+        return (self.total.wins + self.total.draws / 2) / n if n else 0.0
+
+    @property
     def wilson(self) -> tuple[float, float]:
         return wilson_interval(self.total.wins, len(self.games))
 
@@ -155,9 +201,17 @@ def wilson_interval(wins: int, n: int, z: float = 1.959964) -> tuple[float, floa
 
 
 def play_game(
-    bot_a: Bot, bot_b: Bot, a_color: int, max_moves: int = DEFAULT_MAX_MOVES, index: int = 0
+    bot_a: Bot,
+    bot_b: Bot,
+    a_color: int,
+    max_moves: int = DEFAULT_MAX_MOVES,
+    index: int = 0,
+    seed: int | None = None,
 ) -> GameResult:
-    """One game. Bots are called only on non-terminal positions; move limit gives a draw."""
+    """One game. Bots are called only on non-terminal positions; move limit gives a draw.
+
+    A bot exception or an illegal bot move is re-raised as GameError (with game context).
+    """
     bots = {a_color: bot_a, 1 - a_color: bot_b}
     state = GameState.initial()
     log: list[str] = []
@@ -167,11 +221,15 @@ def play_game(
     while winner(state) is None and plies < max_moves:
         side = state.turn
         t0 = time.perf_counter()
-        move = bots[side].choose_move(state)
-        spent[side] += time.perf_counter() - t0
-        count[side] += 1
-        log.append(format_move(move))
-        state = apply_move(state, move)  # checked: an illegal bot move raises
+        try:
+            move = bots[side].choose_move(state)
+            spent[side] += time.perf_counter() - t0
+            count[side] += 1
+            new_state = apply_move(state, move)  # checked: an illegal bot move raises
+            log.append(format_move(move))
+        except Exception as e:
+            raise GameError(index, seed, a_color, side, log, e) from e
+        state = new_state
         plies += 1
     return GameResult(
         index=index,
@@ -193,11 +251,13 @@ def run_match(
     seed: int = 0,
     max_moves: int = DEFAULT_MAX_MOVES,
     registry: Mapping[str, BotFactory] | None = None,
+    on_game: Callable[[GameResult], None] | None = None,
 ) -> MatchResult:
     """Play `games` games A vs B. A is white in even-numbered games, black in odd ones.
 
     With an odd `games` A gets white one time more than black. Per-game seeds derive from
-    (seed, game index); bot A gets 2*s, bot B gets 2*s+1.
+    (seed, game index); bot A gets 2*s, bot B gets 2*s+1. `on_game` is called after each
+    finished game (progress hook; run_match itself does no I/O). A bot failure raises GameError.
     """
     if games < 0:
         raise ValueError("games must be >= 0")
@@ -209,7 +269,10 @@ def run_match(
         bot_a = make_bot(a, 2 * s, registry)
         bot_b = make_bot(b, 2 * s + 1, registry)
         a_color = WHITE if i % 2 == 0 else BLACK
-        results.append(play_game(bot_a, bot_b, a_color, max_moves, i))
+        res = play_game(bot_a, bot_b, a_color, max_moves, i, s)
+        results.append(res)
+        if on_game is not None:
+            on_game(res)
     return MatchResult(a, b, seed, max_moves, tuple(results))
 
 
@@ -220,7 +283,7 @@ def _fmt_tally(t: Tally) -> str:
 def format_report(m: MatchResult, elapsed: float | None = None) -> str:
     n = len(m.games)
     lo, hi = m.wilson
-    lines = [f"Матч: A={m.a} против B={m.b}, партий {n}, seed {m.seed}, лимит {m.max_moves} п/х"]
+    lines = [f"Матч: A={m.a} против B={m.b}, партий: {n}, seed {m.seed}, лимит {m.max_moves} п/х"]
     if m.mirror_deterministic:
         lines.append(
             f"ПРЕДУПРЕЖДЕНИЕ: {m.a} против {m.b} почти детерминирован (seed влияет только на "
@@ -228,7 +291,7 @@ def format_report(m: MatchResult, elapsed: float | None = None) -> str:
         )
     wa, ba = m.as_white.games, m.as_black.games
     note = "" if wa == ba else f" (нечётное число партий: A белыми на {wa - ba} больше)"
-    lines.append(f"A белыми: {wa} партий, A чёрными: {ba}{note}")
+    lines.append(f"Партий: A белыми {wa}, A чёрными {ba}{note}")
     lines.append(f"Итого для A: {_fmt_tally(m.total)}")
     lines.append(f"  белыми: {_fmt_tally(m.as_white)}")
     lines.append(f"  чёрными: {_fmt_tally(m.as_black)}")
@@ -236,6 +299,7 @@ def format_report(m: MatchResult, elapsed: float | None = None) -> str:
         f"Доля побед A: {m.win_rate * 100:.1f}% (ничьи не в счёт побед), "
         f"95% Уилсон: [{lo * 100:.1f}%, {hi * 100:.1f}%]"
     )
+    lines.append(f"Счёт A (W + D/2)/n: {m.score * 100:.1f}%")
     lines.append(f"Среднее число ходов (полуходов) за партию: {m.avg_plies:.1f}")
     lines.append(
         f"Среднее время хода: A {m.avg_move_time_a * 1000:.2f} мс, "
@@ -257,10 +321,16 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _progress_line(g: GameResult) -> str:
+    side = "белыми" if g.a_color == WHITE else "чёрными"
+    return f"Партия {g.index + 1}: A {side}, {g.outcome_for_a}, {g.plies} п/х"
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    if hasattr(sys.stdout, "reconfigure"):
-        sys.stdout.reconfigure(encoding="utf-8")
+    for stream in (sys.stdout, sys.stderr):  # Russian text on Windows consoles
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8")
     if args.games < 1 or args.max_moves < 1:
         print("Ошибка: --games и --max-moves должны быть >= 1", file=sys.stderr)
         return 2
@@ -270,13 +340,27 @@ def main(argv: Sequence[str] | None = None) -> int:
     except UnknownBotError as e:
         print(f"Ошибка: {e}", file=sys.stderr)
         return 2
+
+    def on_game(g: GameResult) -> None:
+        print(_progress_line(g), flush=True)
+
     t0 = time.perf_counter()
-    result = run_match(args.games, args.a, args.b, args.seed, args.max_moves)
+    try:
+        result = run_match(
+            args.games,
+            args.a,
+            args.b,
+            args.seed,
+            args.max_moves,
+            on_game=None if args.quiet else on_game,
+        )
+    except GameError as e:
+        print(f"Ошибка матча: {e}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("\nМатч прерван.", file=sys.stderr)
+        return EXIT_INTERRUPTED
     elapsed = time.perf_counter() - t0
-    if not args.quiet:
-        for g in result.games:
-            side = "белыми" if g.a_color == WHITE else "чёрными"
-            print(f"Партия {g.index + 1}: A {side}, {g.outcome_for_a}, {g.plies} п/х")
     print(format_report(result, elapsed))
     return 0
 
