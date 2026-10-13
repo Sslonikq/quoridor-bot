@@ -35,6 +35,7 @@ def check_invariants(s: GameState) -> None:
     assert s.turn in (0, 1)
 
 
+@pytest.mark.slow
 @HSETTINGS
 @given(seed=st.integers(0, 10**9), bias=st.floats(0.0, 1.0))
 def test_hypothesis_invariants_hold_in_every_position(seed, bias):
@@ -42,6 +43,7 @@ def test_hypothesis_invariants_hold_in_every_position(seed, bias):
         check_invariants(s)
 
 
+@pytest.mark.slow
 @HSETTINGS
 @given(seed=st.integers(0, 10**9))
 def test_hypothesis_every_generated_move_keeps_position_legal(seed):
@@ -56,6 +58,7 @@ def test_hypothesis_every_generated_move_keeps_position_legal(seed):
             check_invariants(apply_move(s, m))
 
 
+@pytest.mark.slow
 @HSETTINGS
 @given(seed=st.integers(0, 10**9))
 def test_hypothesis_notation_roundtrip_for_all_legal_moves(seed):
@@ -64,6 +67,7 @@ def test_hypothesis_notation_roundtrip_for_all_legal_moves(seed):
             assert parse_move(format_move(m)) == m
 
 
+@pytest.mark.slow
 @HSETTINGS
 @given(seed=st.integers(0, 10**9))
 def test_hypothesis_pawn_moves_match_reference_model(seed):
@@ -75,6 +79,7 @@ def test_hypothesis_pawn_moves_match_reference_model(seed):
         assert set(got) == ref_pawn_dests(s)
 
 
+@pytest.mark.slow
 @HSETTINGS
 @given(seed=st.integers(0, 10**9))
 def test_hypothesis_wall_legality_matches_reference_model(seed):

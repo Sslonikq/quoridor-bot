@@ -142,8 +142,10 @@ def test_wall_with_zero_left_rejected_and_state_unchanged():
 
 def test_overlapping_wall_rejected():
     res, out = run(["e3h", "e3h", "e3v", "quit"], bot=FirstLegalPawnBot())
-    # first wall accepted (bot replies), repeat and cross are illegal
-    assert out.count("нелегален") >= 1 and "Бот ходит" in out
+    # first wall accepted (bot replies once); the exact repeat and the cross at the same
+    # centre are both rejected, so exactly two rejections and exactly one bot reply
+    assert out.count("нелегален") == 2
+    assert out.count("Бот ходит") == 1
 
 
 def test_wall_blocking_last_path_rejected():

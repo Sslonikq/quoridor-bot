@@ -1,5 +1,7 @@
 import time
 
+import pytest
+
 from quoridor.bots import GreedyBot, RandomBot, candidate_walls
 from quoridor.paths import shortest_path, shortest_path_length
 from quoridor.rules import apply_move, is_legal_move, is_terminal, pawn_moves, wall_moves, winner
@@ -23,6 +25,7 @@ def play(white, black, max_plies=MAX_PLIES):
     return s, plies
 
 
+@pytest.mark.slow
 def test_moves_always_legal_on_random_positions():
     for seed in range(4):
         for i, s in enumerate(random_game(seed, max_plies=60)):
@@ -46,6 +49,7 @@ def test_greedy_wins_in_one_move():
     assert GreedyBot(0).choose_move(s) == PawnMove(0, 0)
 
 
+@pytest.mark.slow
 def test_greedy_chooses_wall_only_if_strictly_better():
     walls_chosen = 0
     for seed in range(4):
@@ -61,16 +65,45 @@ def test_greedy_chooses_wall_only_if_strictly_better():
     assert walls_chosen > 0
 
 
+def _lengthening_walls(s):
+    me = s.turn
+    base = shortest_path_length(s, 1 - me)
+    return {w for w in wall_moves(s) if shortest_path_length(apply_move(s, w), 1 - me) > base}
+
+
 def test_candidate_walls_complete_for_lengthening():
     s = mk(white="e4", black="e6", turn=0)
     cands = set(candidate_walls(s))
-    base = shortest_path_length(s, BLACK)
-    lengthening = {w for w in wall_moves(s) if shortest_path_length(apply_move(s, w), BLACK) > base}
-    assert lengthening <= cands
+    assert _lengthening_walls(s) <= cands
     path = shortest_path(s, BLACK)
     assert path[0] == s.pawns[BLACK] and path[-1][1] == 0
 
 
+@pytest.mark.parametrize("seed", range(6))
+def test_candidate_walls_complete_on_random_positions(seed):
+    checked = 0
+    for i, s in enumerate(random_game(seed, max_plies=70, wall_bias=0.6)):
+        if is_terminal(s) or i % 4:
+            continue
+        cands = candidate_walls(s)
+        assert len(cands) == len(set(cands))
+        assert set(cands) <= set(wall_moves(s))  # every candidate is legal
+        assert _lengthening_walls(s) <= set(cands), (seed, i)
+        checked += 1
+    assert checked > 5
+
+
+@pytest.mark.parametrize("turn", [0, 1])
+def test_candidate_walls_empty_when_no_walls_left(turn):
+    walls_left = (0, 10) if turn == 0 else (10, 0)
+    s = mk(white="e4", black="e6", turn=turn, walls_left=walls_left)
+    assert candidate_walls(s) == []
+    # the opponent still has walls, so the generator is keyed to the side to move
+    s2 = mk(white="e4", black="e6", turn=turn, walls_left=(10, 10))
+    assert candidate_walls(s2)
+
+
+@pytest.mark.slow
 def test_greedy_beats_random():
     wins = 0
     games = 20

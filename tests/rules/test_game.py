@@ -56,6 +56,7 @@ def test_is_legal_move_wall_and_pawn():
     assert is_legal_move(s, WallMove(0, 0, "h"))
 
 
+@pytest.mark.slow
 def test_random_playouts_stay_consistent():
     rng = random.Random(1)
     for _ in range(15):

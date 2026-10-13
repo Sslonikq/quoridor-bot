@@ -10,6 +10,7 @@ dev = ["pytest", "ruff", "hypothesis"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+markers = ["slow: long tests (hypothesis, full games); skip with -m \"not slow\""]
 
 [tool.ruff]
 line-length = 100
