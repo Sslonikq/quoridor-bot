@@ -3,27 +3,31 @@
 Format: pawn move = destination cell ("e2"); wall = anchor cell + orientation
 ("e3h", "f3v").
 
-WARNING: which corner of the anchor cell the site attaches a wall to is NOT
-CONFIRMED. Current ASSUMPTION: anchor cell (col,row) maps directly to internal
-WallMove(x=col, y=row), i.e. the wall sits at the anchor cell's top-right corner:
-'h' runs along the cell's top edge and extends one cell to the right; 'v' runs
-along its right edge and extends one cell up. If the site differs, change only
-_anchor_to_internal / _internal_to_anchor.
+Wall anchor (confirmed on the site): the TOP-LEFT cell of the 2x2 square the
+wall belongs to (ranks counted from 1 at the bottom).
+  'h': lies between the anchor's rank and the rank below, covers the anchor's
+       column and the column to its right. "a4h" = between ranks 4 and 3,
+       covering columns a, b.
+  'v': lies between the anchor's column and the column to its right, covers the
+       anchor's rank and the rank below. "a2v" = between columns a and b,
+       covering ranks 2 and 1.
+Valid anchors: columns a-h, ranks 2-9. Internally (state.py) the wall is
+WallMove(x=col, y=row0 - 1), where row0 is the 0-based rank of the anchor.
 """
 
 from __future__ import annotations
 
 from quoridor.state import BOARD_SIZE, WALL_GRID, H, Move, PawnMove, V, WallMove
 
-ANCHOR_ASSUMPTION = "top-right corner of anchor cell (UNCONFIRMED)"
+ANCHOR_ASSUMPTION = "top-left cell of the 2x2 square (confirmed): internal (x, y) = (col, row0 - 1)"
 
 
 def _anchor_to_internal(col: int, row: int) -> tuple[int, int]:
-    return col, row
+    return col, row - 1
 
 
 def _internal_to_anchor(x: int, y: int) -> tuple[int, int]:
-    return x, y
+    return x, y + 1
 
 
 def _cell(s: str) -> tuple[int, int]:
@@ -55,5 +59,7 @@ def format_move(move: Move) -> str:
         if not (0 <= move.col < BOARD_SIZE and 0 <= move.row < BOARD_SIZE):
             raise ValueError(f"cell out of board: {move}")
         return _name(move.col, move.row)
+    if move.orient not in (H, V) or not (0 <= move.x < WALL_GRID and 0 <= move.y < WALL_GRID):
+        raise ValueError(f"wall out of range: {move}")
     c, r = _internal_to_anchor(move.x, move.y)
     return f"{_name(c, r)}{move.orient}"

@@ -1,0 +1,12 @@
+{
+  "description": "Итоговая позиция партии 01 (сверено со скриншотами screens/game01_final_*.png)",
+  "white": "c4",
+  "black": "i3",
+  "walls_left": {"white": 4, "black": 0},
+  "walls": {
+    "white": ["a2v", "f3v", "g5v", "e4h", "g2h", "h6v"],
+    "black": ["a4h", "b3v", "c2h", "e2h", "f5h", "h4h", "d5h", "c3v", "g3h", "b5h"]
+  },
+  "to_move": "white",
+  "winner": null
+}
