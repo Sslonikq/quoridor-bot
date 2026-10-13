@@ -3,8 +3,8 @@
 Internal coordinates (independent of the site notation):
   cell  = (col, row), both 0..8; col 0 = 'a', row 0 = rank '1'.
   wall  = WallMove(x, y, orient) with x, y in 0..7. The wall is anchored at the
-          top-right corner of cell (x, y), i.e. at the grid point shared by cells
-          (x,y), (x+1,y), (x,y+1), (x+1,y+1).
+          top-right corner of the BOTTOM-LEFT cell (x, y) of a 2x2 square, i.e. at the
+          grid point shared by cells (x,y), (x+1,y), (x,y+1), (x+1,y+1).
     'h': lies between rows y and y+1, covering columns x and x+1.
     'v': lies between columns x and x+1, covering rows y and y+1.
 This anchor is NOT the site-notation anchor (top-left); conversion lives only in notation.py.

@@ -7,9 +7,9 @@ import sys
 from collections.abc import Callable, Sequence
 
 from quoridor.bots import Bot, GreedyBot, RandomBot
-from quoridor.notation import format_move, parse_move
+from quoridor.notation import col_name, format_move, parse_move, row_name
 from quoridor.rules import apply_move, is_legal_move, legal_moves, winner
-from quoridor.state import BLACK, BOARD_SIZE, WHITE, GameState
+from quoridor.state import BLACK, BOARD_SIZE, WHITE, GameState, PawnMove, WallMove
 
 DEFAULT_MAX_MOVES = 300
 PAWN_CHAR = ("W", "B")
@@ -23,9 +23,9 @@ def render(state: GameState) -> str:
     Between rows, '---' marks a horizontal wall on that edge; the junction char is
     '-' / '|' where a wall's middle lies. Everything is derived from GameState.blocked.
     """
-    lines = ["  " + "".join(f" {ch}  " for ch in "abcdefghi").rstrip()]
+    lines = ["  " + "".join(f" {col_name(c)}  " for c in range(BOARD_SIZE)).rstrip()]
     for row in range(BOARD_SIZE - 1, -1, -1):
-        text = f"{row + 1} "
+        text = f"{row_name(row)} "
         for col in range(BOARD_SIZE):
             if state.pawns[WHITE] == (col, row):
                 ch = PAWN_CHAR[WHITE]
@@ -36,7 +36,7 @@ def render(state: GameState) -> str:
             text += f" {ch} "
             if col < BOARD_SIZE - 1:
                 text += "|" if state.blocked(col, row, 1, 0) else " "
-        lines.append(text)
+        lines.append(text.rstrip())
         if row > 0:
             seg = "  "
             for col in range(BOARD_SIZE):
@@ -73,7 +73,8 @@ def play(
     The human side is driven by input_fn(prompt); the other side by `bot`
     (bot=None means both sides are human). EOF on input counts as quit.
     """
-    state = state or GameState.initial()
+    if state is None:
+        state = GameState.initial()
     plies = 0
     output_fn(HELP)
     while True:
@@ -104,7 +105,11 @@ def play(
                     output_fn(HELP)
                     continue
                 if raw == "moves":
-                    output_fn(" ".join(sorted(format_move(m) for m in legal_moves(state))))
+                    all_moves = legal_moves(state)
+                    pawn = sorted(format_move(m) for m in all_moves if isinstance(m, PawnMove))
+                    walls = sorted(format_move(m) for m in all_moves if isinstance(m, WallMove))
+                    output_fn("Шаги: " + " ".join(pawn))
+                    output_fn("Постановки: " + (" ".join(walls) if walls else "нет"))
                     continue
                 try:
                     cand = parse_move(raw)
@@ -139,7 +144,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             stream.reconfigure(encoding="utf-8")
     bot: Bot = RandomBot(args.seed) if args.bot == "random" else GreedyBot(args.seed)
     color = WHITE if args.color == "white" else BLACK
-    play(input, print, bot=bot, human_color=color, max_moves=args.max_moves)
+    try:
+        play(input, print, bot=bot, human_color=color, max_moves=args.max_moves)
+    except KeyboardInterrupt:
+        print("\nВыход.")
     return 0
 
 

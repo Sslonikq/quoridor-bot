@@ -36,8 +36,18 @@ def _cell(s: str) -> tuple[int, int]:
     return ord(s[0]) - ord("a"), int(s[1]) - 1
 
 
+def col_name(col: int) -> str:
+    """Column label ('a'..'i') for a 0-based column."""
+    return chr(ord("a") + col)
+
+
+def row_name(row: int) -> str:
+    """Rank label ('1'..'9') for a 0-based row."""
+    return str(row + 1)
+
+
 def _name(col: int, row: int) -> str:
-    return f"{chr(ord('a') + col)}{row + 1}"
+    return f"{col_name(col)}{row_name(row)}"
 
 
 def parse_move(s: str) -> Move:

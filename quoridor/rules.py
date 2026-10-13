@@ -121,6 +121,12 @@ def apply_move(state: GameState, move: Move) -> GameState:
     """Apply a move; raises ValueError if illegal."""
     if not is_legal_move(state, move):
         raise ValueError(f"illegal move: {move}")
+    return apply_move_unchecked(state, move)
+
+
+def apply_move_unchecked(state: GameState, move: Move) -> GameState:
+    """Apply a move WITHOUT legality checks. For internal callers (bots, search) that
+    already took the move from legal generators; illegal input gives undefined results."""
     p = state.turn
     if isinstance(move, PawnMove):
         pawns = list(state.pawns)

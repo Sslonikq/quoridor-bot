@@ -1,6 +1,6 @@
 from quoridor.bots import GreedyBot
 from quoridor.cli import build_parser, play, render, status
-from quoridor.notation import format_move, parse_move
+from quoridor.notation import col_name, format_move, parse_move
 from quoridor.rules import apply_move, legal_moves, winner
 from quoridor.state import BLACK, BOARD_SIZE, WHITE, GameState, PawnMove, WallMove
 from tests.helpers import mk
@@ -34,7 +34,7 @@ class FirstLegalPawnBot:
 
 def test_render_initial():
     lines = render(GameState.initial()).split("\n")
-    assert lines[0].split() == list("abcdefghi")
+    assert lines[0].split() == [col_name(c) for c in range(BOARD_SIZE)]
     assert lines[1].startswith("9 ") and lines[1].split()[1:][4] == "B"
     assert lines[-1].startswith("1 ") and lines[-1].split()[1:][4] == "W"
     assert "|" not in render(GameState.initial()) and "-" not in render(GameState.initial())
@@ -95,6 +95,27 @@ def test_render_matches_blocked_on_random_positions():
     assert n > 100
 
 
+def test_render_junction_matches_wall_sets_on_random_positions():
+    """Junction char between 4 cells is '-' for an h-wall centre, '|' for a v-wall centre."""
+    h_seen = v_seen = 0
+    for seed in range(6):
+        for s in random_game(seed, max_plies=80, wall_bias=0.8):
+            _, between = _parse_render(render(s))
+            for r in range(1, BOARD_SIZE):
+                b = between[r].ljust(40)
+                for c in range(BOARD_SIZE - 1):
+                    ch = b[2 + 4 * c + 3]
+                    if (c, r - 1) in s.h_walls:
+                        assert ch == "-"
+                        h_seen += 1
+                    elif (c, r - 1) in s.v_walls:
+                        assert ch == "|"
+                        v_seen += 1
+                    else:
+                        assert ch == " "
+    assert h_seen > 20 and v_seen > 20
+
+
 def test_illegal_then_legal_then_quit():
     res, out = run(["zz", "e5", "e3", "e2", "quit"], bot=FirstLegalPawnBot())
     assert res == "quit"
@@ -107,6 +128,37 @@ def test_moves_command_lists_legal():
     res, out = run(["moves", "exit"], bot=FirstLegalPawnBot())
     assert res == "quit"
     assert "e2" in out and "d1" in out and "a4h" in out
+    lines = out.split("\n")
+    pawn_line = next(ln for ln in lines if ln.startswith("Шаги:"))
+    wall_line = next(ln for ln in lines if ln.startswith("Постановки:"))
+    assert pawn_line.split()[1:] == ["d1", "e2", "f1"]
+    assert all(t[-1] in "hv" and len(t) == 3 for t in wall_line.split()[1:])
+    assert "a4h" in wall_line.split() and "a4h" not in pawn_line
+
+
+def test_moves_command_without_walls_left():
+    s = mk(walls_left=(0, 10))
+    res, out = run(["moves", "quit"], bot=FirstLegalPawnBot(), state=s)
+    assert "Постановки: нет" in out
+
+
+def test_ctrl_c_exits_with_zero(monkeypatch, capsys):
+    import builtins
+
+    from quoridor.cli import main
+
+    def boom(prompt=""):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(builtins, "input", boom)
+    assert main(["--bot", "random"]) == 0
+    assert "Выход." in capsys.readouterr().out
+
+
+def test_render_has_no_trailing_spaces():
+    s = mk(h=[parse_wall("e3h")], v=[parse_wall("a2v")])
+    for ln in render(s).split("\n"):
+        assert ln == ln.rstrip()
 
 
 def test_eof_is_quit():

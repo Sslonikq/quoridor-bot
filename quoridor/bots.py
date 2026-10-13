@@ -6,8 +6,9 @@ import random
 from typing import Protocol
 
 from quoridor.paths import shortest_path, shortest_path_length
-from quoridor.rules import apply_move, is_wall_legal, legal_moves, pawn_moves
+from quoridor.rules import apply_move_unchecked, is_wall_legal, legal_moves, pawn_moves
 from quoridor.state import (
+    WALL_GRID,
     Cell,
     GameState,
     H,
@@ -67,7 +68,7 @@ def candidate_walls(state: GameState) -> list[WallMove]:
     out: list[WallMove] = []
     for a, b in zip(path, path[1:], strict=False):
         for w in _edge_blockers(a, b):
-            if w in seen or not (0 <= w.x < 8 and 0 <= w.y < 8):
+            if w in seen or not (0 <= w.x < WALL_GRID and 0 <= w.y < WALL_GRID):
                 continue
             seen.add(w)
             if is_wall_legal(state, w):
@@ -105,7 +106,7 @@ class GreedyBot:
         best_pawn: list[PawnMove] = []
         best_pawn_score: int | None = None
         for m in pawns:
-            sc = self._score(apply_move(state, m), me)
+            sc = self._score(apply_move_unchecked(state, m), me)
             if best_pawn_score is None or sc > best_pawn_score:
                 best_pawn_score, best_pawn = sc, [m]
             elif sc == best_pawn_score:
@@ -114,7 +115,7 @@ class GreedyBot:
         best_wall: list[WallMove] = []
         best_wall_score: int | None = None
         for w in candidate_walls(state):
-            sc = self._score(apply_move(state, w), me)
+            sc = self._score(apply_move_unchecked(state, w), me)
             if best_wall_score is None or sc > best_wall_score:
                 best_wall_score, best_wall = sc, [w]
             elif sc == best_wall_score:
