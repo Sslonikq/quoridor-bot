@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from quoridor.state import BOARD_SIZE, WALL_GRID, H, Move, PawnMove, V, WallMove
 
-ANCHOR_ASSUMPTION = "top-left cell of the 2x2 square (confirmed): internal (x, y) = (col, row0 - 1)"
+ANCHOR = "top-left cell of the 2x2 square (confirmed): internal (x, y) = (col, row0 - 1)"
 
 
 def _anchor_to_internal(col: int, row: int) -> tuple[int, int]:

@@ -7,6 +7,7 @@ Internal coordinates (independent of the site notation):
           (x,y), (x+1,y), (x,y+1), (x+1,y+1).
     'h': lies between rows y and y+1, covering columns x and x+1.
     'v': lies between columns x and x+1, covering rows y and y+1.
+This anchor is NOT the site-notation anchor (top-left); conversion lives only in notation.py.
 """
 
 from __future__ import annotations

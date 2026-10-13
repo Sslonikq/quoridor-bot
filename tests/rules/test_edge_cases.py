@@ -14,7 +14,7 @@ from quoridor.rules import (
     winner,
 )
 from quoridor.state import GameState, PawnMove, WallMove
-from tests.helpers import cells, dests, mk
+from tests.helpers import cell, cells, dests, mk
 
 
 # --- jumps / diagonals in all four directions --------------------------------
@@ -32,9 +32,8 @@ def test_jump_and_diagonals_all_directions(me, opp, straight, diags):
     assert cells(straight) <= dests(pawn_moves(free))
     assert not (cells(*diags) & dests(pawn_moves(free)))
     # wall right behind the opponent: straight disappears, both diagonals appear
-    dc = ord(opp[0]) - ord(me[0])
-    dr = int(opp[1]) - int(me[1])
-    oc, orow = ord(opp[0]) - 97, int(opp[1]) - 1
+    (mc, mr), (oc, orow) = cell(me), cell(opp)
+    dc, dr = oc - mc, orow - mr
     if dr:
         walled = mk(white=me, black=opp, h={(oc, orow if dr == 1 else orow - 1)})
     else:

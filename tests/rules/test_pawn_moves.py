@@ -1,6 +1,6 @@
 from quoridor.rules import pawn_moves
 from quoridor.state import GameState
-from tests.helpers import cells, dests, mk
+from tests.helpers import cell_name, cells, dests, mk
 
 
 def test_initial_state():
@@ -27,7 +27,7 @@ def test_wall_blocks_step():
     assert dests(pawn_moves(s)) == cells("e1", "g1")
     # but not column g
     s = mk(white="g1", h={(4, 0)})
-    assert "g2" in {f"{chr(97 + c)}{r + 1}" for c, r in dests(pawn_moves(s))}
+    assert "g2" in {cell_name(c) for c in dests(pawn_moves(s))}
 
 
 def test_vertical_wall_blocks_sideways_both_rows():
@@ -37,7 +37,7 @@ def test_vertical_wall_blocks_sideways_both_rows():
     s = mk(white="e2", v={(3, 0)})
     assert dests(pawn_moves(s)) == cells("f2", "e1", "e3")
     s = mk(white="e3", v={(3, 0)})
-    assert "d3" in {f"{chr(97 + c)}{r + 1}" for c, r in dests(pawn_moves(s))}
+    assert "d3" in {cell_name(c) for c in dests(pawn_moves(s))}
 
 
 def test_black_moves_down_blocked_by_wall_below():
