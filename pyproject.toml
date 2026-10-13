@@ -4,6 +4,9 @@ version = "0.1.0"
 description = "Quoridor bot (offline)"
 requires-python = ">=3.11"
 
+[project.optional-dependencies]
+dev = ["pytest", "ruff", "hypothesis"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
