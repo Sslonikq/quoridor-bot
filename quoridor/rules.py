@@ -135,6 +135,17 @@ def wall_fits(state: GameState, w: WallMove) -> bool:
 
 
 def is_wall_legal(state: GameState, w: WallMove) -> bool:
+    """Full legality of placing wall `w` for the side to move.
+
+    Checks: orientation, on board, walls left, no overlap/crossing, and that after the
+    wall both players still have a path to their goal row.
+
+    Precondition: in `state` BOTH players already have a path to their goal (always true
+    for states reached by legal play). The path check is shortcut by a topological test
+    (`_cannot_cut`) that relies on it. For an artificially cut-off state (e.g. built from
+    a misrecognised screen) a fitting wall far from the cut may be reported legal, while
+    a full BFS would reject it. Validate such states with `has_path_to_goal` first.
+    """
     if not wall_fits(state, w):
         return False
     if _cannot_cut(state, w):
