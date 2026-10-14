@@ -160,7 +160,7 @@ def test_log_uses_notation_and_replays_legally():
 def test_report_text_and_mirror_warning():
     m = run_match(3, "runner", "idler", registry=STUBS, max_moves=100)
     text = format_report(m)
-    assert "W 3 / L 0 / D 0" in text and "Уилсон" in text and "нечётное" in text
+    assert "W 3 / L 0 / D (лимит ходов) 0" in text and "Уилсон" in text and "нечётное" in text
     assert not m.mirror_deterministic
     g = run_match(4, "greedy", "greedy", max_moves=20)
     assert g.mirror_deterministic

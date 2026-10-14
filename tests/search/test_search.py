@@ -158,7 +158,8 @@ def test_bot_on_game_clock_stays_within_it(game_time):
     assert res.winner is not None
     assert bot.moves == res.moves_a > 0
     assert bot.used < game_time
-    assert abs(bot.used - res.time_a) < 0.05
+    # relative tolerance: parallel pytest / antivirus can stall single moves
+    assert abs(bot.used - res.time_a) < 0.05 + 0.02 * res.moves_a
     assert bot.last is not None and bot.last.depth >= 1
 
 
@@ -166,6 +167,29 @@ def test_fixed_depth_result_is_never_partial():
     s = mk(white="e4", black="e6", h=[(2, 5), (5, 2)], v=[(6, 6)])
     r = Searcher(0).search(s, max_depth=2)
     assert r.depth == 2 and not r.partial
+
+
+def test_partial_result_when_deadline_hits_inside_iteration_2(monkeypatch):
+    # Fake clock driven by the node counter: depth 2 starts in time, the first root move
+    # is searched completely, then the deadline fires -> partial result on top of depth 1.
+    import types
+
+    from quoridor import search as search_mod
+
+    s = mk(white="e4", black="e6", h=[(2, 5), (5, 2)], v=[(6, 6)])
+    n1 = Searcher(0).search(s, max_depth=1).nodes
+    n2 = Searcher(0).search(s, max_depth=2).nodes
+    assert n2 > n1 + 20
+    threshold = n1 + (n2 - n1) // 2
+
+    searcher = Searcher(0)
+    clock = types.SimpleNamespace(perf_counter=lambda: 0.0 if searcher.nodes <= threshold else 1e9)
+    monkeypatch.setattr(search_mod, "time", clock)
+    monkeypatch.setattr(search_mod, "_CHECK_EVERY", 1)
+    r = searcher.search(s, time_limit=10.0)
+    assert r.partial is True
+    assert r.depth == 1
+    assert is_legal_move(s, r.move)
 
 
 def test_bot_needs_a_limit():

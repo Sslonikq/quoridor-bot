@@ -277,7 +277,7 @@ def run_match(
 
 
 def _fmt_tally(t: Tally) -> str:
-    return f"W {t.wins} / L {t.losses} / D {t.draws}"
+    return f"W {t.wins} / L {t.losses} / D (лимит ходов) {t.draws}"
 
 
 def format_report(m: MatchResult, elapsed: float | None = None) -> str:

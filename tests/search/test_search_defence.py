@@ -84,6 +84,22 @@ def test_mirrored_review_position_for_white():
         assert Searcher(0).search(s, max_depth=depth).move in saves
 
 
+def test_jump_threat_from_two_rows_white_e7_black_e8():
+    # Black to move; white (goal row 9) at e7 threatens to jump over e8 onto e9.
+    # Walls on the edges e7-e8 (d8h, e8h) or e8-e9 (d9h, e9h) stop it.
+    s = mk(white="e7", black="e8", turn=BLACK, walls_left=(5, 5))
+    assert threatened(s)
+    saves = set(saving_moves(s))
+    walls = {m for m in saves if isinstance(m, WallMove)}
+    assert walls == {parse_move(x) for x in ("d8h", "e8h", "d9h", "e9h")}
+    cands = {w for _, w, _ in Searcher(0, wall_limit=1).candidate_walls(s)}
+    assert cands == walls
+    for depth in (1, 2, 3):
+        r = Searcher(0).search(s, max_depth=depth)
+        assert r.move in saves, r
+        assert not (is_win_score(r.score) and r.score < 0), r
+
+
 def test_threat_walls_are_legal_and_all_stop_the_win():
     s = mk(**REVIEW)
     for _, w, child in Searcher(0, wall_limit=1).candidate_walls(s):
@@ -106,7 +122,8 @@ def test_no_walls_left_nothing_to_defend_with():
 def threat_positions(n_seeds: int, rng_seed: int = 0, per_state: int = 6):
     """Positions where the opponent threatens a win in 1 and at least one saving move exists.
 
-    The opponent is moved one row before its goal; walls come from random games.
+    The opponent is k in {1, 2} rows before its goal; with k = 2 our pawn stands between
+    it and the goal row (a direct-jump threat). Walls come from random games.
     """
     rng = random.Random(rng_seed)
     out = []
@@ -115,9 +132,13 @@ def threat_positions(n_seeds: int, rng_seed: int = 0, per_state: int = 6):
         for s in states[::6]:
             for _ in range(per_state):
                 me, op = s.turn, 1 - s.turn
-                orow = goal_row(op) + (-1 if goal_row(op) == 8 else 1)
-                oc = (rng.randrange(9), orow)
-                mc = (rng.randrange(9), rng.randrange(9))
+                step = -1 if goal_row(op) == 8 else 1
+                k = rng.choice((1, 2))
+                oc = (rng.randrange(9), goal_row(op) + k * step)
+                if k == 2:
+                    mc = (oc[0], goal_row(op) + step)
+                else:
+                    mc = (rng.randrange(9), rng.randrange(9))
                 if mc == oc or mc[1] == goal_row(me):
                     continue
                 pawns = [None, None]
