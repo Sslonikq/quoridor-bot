@@ -17,8 +17,16 @@
   wins / slower losses are preferred).
 * Distances: bitboard BFS (quoridor.bitpaths), memoised per search by (wall masks, pawn
   cell, player), so a leaf evaluation usually reuses the BFS done while ordering its
-  parent's moves. Candidate walls are scored on child masks without building a child
+  parent's moves. The memo caches are bounded (cleared when full, see cache_limit) and
+  freed when search() returns. Candidate walls are scored on child masks without building a child
   state; states are built only for the kept walls.
+* Transposition table (v2, tt_bits > 0): a fixed-size list owned by the Searcher,
+  indexed by an incremental Zobrist key (pawns, walls, walls left, side to move), entry =
+  (key, depth, value, bound, best move); always-replace. Values are reused only from
+  entries of exactly the same remaining depth (and mate scores are stored relative to
+  the node), so with a fixed depth the search returns the same scores as without the
+  table; entries of any depth give their best move, which is tried first. The table is
+  rebuilt empty at every search() and dropped on return.
 * Limits: fixed depth (deterministic, for the arena/tests) and/or a time budget. On
   timeout the result of the last completed iteration (or a fully searched improvement
   from the current one) is returned. Root ties are broken by a seeded shuffle.
@@ -47,7 +55,67 @@ from quoridor.state import WALL_GRID, Cell, GameState, H, Move, PawnMove, V, Wal
 INF = WIN * 2
 MAX_DEPTH = 64
 DEFAULT_WALL_LIMIT = 10
+# Memo caches are cleared when they reach this many entries (distance cache; masks and
+# paths get a quarter each), so memory stays bounded however long the search runs.
+DEFAULT_CACHE_LIMIT = 300_000
 _CHECK_EVERY = 64  # nodes between clock checks
+V2_TT_BITS = 18  # 2**18 = 262 144 entries (bounded memory, see report 0036)
+
+# ---- Zobrist keys (immutable module constants, fixed seed: reproducible) ----
+_ZMAX_WALLS = 128  # walls_left values covered; larger stocks disable the table
+_zrng = random.Random(0x51D0B0A2)
+_ZPAWN = tuple(tuple(_zrng.getrandbits(64) for _ in range(81)) for _ in range(2))
+_ZWALL = {o: tuple(_zrng.getrandbits(64) for _ in range(WALL_GRID * WALL_GRID)) for o in (H, V)}
+_ZSTOCK = tuple(tuple(_zrng.getrandbits(64) for _ in range(_ZMAX_WALLS)) for _ in range(2))
+_ZTURN = _zrng.getrandbits(64)
+del _zrng
+EXACT, LOWER, UPPER = 0, 1, 2  # TT bound types
+
+
+def zobrist(state: GameState) -> int:
+    """Full Zobrist key of a state (the search updates it incrementally: child_key)."""
+    k = _ZTURN if state.turn else 0
+    for p in (0, 1):
+        c, r = state.pawns[p]
+        k ^= _ZPAWN[p][r * 9 + c] ^ _ZSTOCK[p][state.walls_left[p]]
+    for x, y in state.h_walls:
+        k ^= _ZWALL[H][y * WALL_GRID + x]
+    for x, y in state.v_walls:
+        k ^= _ZWALL[V][y * WALL_GRID + x]
+    return k
+
+
+def child_key(key: int, state: GameState, move: Move) -> int:
+    """zobrist(apply_move(state, move)) from key = zobrist(state), in O(1)."""
+    me = state.turn
+    if isinstance(move, PawnMove):
+        c, r = state.pawns[me]
+        return key ^ _ZTURN ^ _ZPAWN[me][r * 9 + c] ^ _ZPAWN[me][move.row * 9 + move.col]
+    n = state.walls_left[me]
+    return (
+        key
+        ^ _ZTURN
+        ^ _ZWALL[move.orient][move.y * WALL_GRID + move.x]
+        ^ _ZSTOCK[me][n]
+        ^ _ZSTOCK[me][n - 1]
+    )
+
+
+def _to_tt(v: int, ply: int) -> int:
+    """Mate scores relative to the node (WIN - ply depends on the path to it)."""
+    if v >= WIN - 10_000:
+        return v + ply
+    if v <= -(WIN - 10_000):
+        return v - ply
+    return v
+
+
+def _from_tt(v: int, ply: int) -> int:
+    if v >= WIN - 10_000:
+        return v - ply
+    if v <= -(WIN - 10_000):
+        return v + ply
+    return v
 
 
 class SearchTimeout(Exception):
@@ -103,10 +171,17 @@ class Searcher:
         seed: int = 0,
         wall_limit: int = DEFAULT_WALL_LIMIT,
         wall_weight: int = WALL,
+        cache_limit: int = DEFAULT_CACHE_LIMIT,
+        tt_bits: int = 0,
     ) -> None:
         self._rng = random.Random(seed)
         self.wall_limit = wall_limit
         self.wall_weight = wall_weight
+        self.cache_limit = max(1, cache_limit)
+        self._small_limit = max(1, cache_limit // 4)
+        self.tt_bits = max(0, tt_bits)  # 0: no transposition table (v1)
+        self._tt: list[tuple | None] | None = None  # allocated per search()
+        self._tt_mask = (1 << self.tt_bits) - 1
         self._dist_cache: dict[tuple, int | None] = {}
         self._mask_cache: dict[tuple, Masks] = {}
         self._path_cache: dict[tuple, list[Cell] | None] = {}
@@ -120,23 +195,35 @@ class Searcher:
         key = (state.h_walls, state.v_walls)
         m = self._mask_cache.get(key)
         if m is None:
-            m = self._mask_cache[key] = build_masks(state.h_walls, state.v_walls)
+            m = build_masks(state.h_walls, state.v_walls)
+            self._store_masks(key, m)
         return m
+
+    def _store_masks(self, key: tuple, m: Masks) -> None:
+        if len(self._mask_cache) >= self._small_limit:
+            self._mask_cache.clear()  # bounded memory; pure memo, only costs recomputation
+        self._mask_cache[key] = m
 
     def dist_m(self, m: Masks, cell: Cell, player: int) -> int | None:
         """BFS length for `player` standing on `cell` with the wall masks `m` (memoised)."""
         key = (m, cell, player)
-        d = self._dist_cache.get(key, -1)
+        cache = self._dist_cache
+        d = cache.get(key, -1)
         if d == -1:
-            d = self._dist_cache[key] = bitpaths.distance(m, bit(cell), GOAL_MASK[player])
+            if len(cache) >= self.cache_limit:
+                cache.clear()
+            d = cache[key] = bitpaths.distance(m, bit(cell), GOAL_MASK[player])
         return d
 
     def path_m(self, m: Masks, cell: Cell, player: int) -> list[Cell] | None:
         """Same path as paths.shortest_path (memoised; callers must not mutate it)."""
         key = (m, cell, player)
-        p = self._path_cache.get(key, 0)
+        cache = self._path_cache
+        p = cache.get(key, 0)
         if p == 0:
-            p = self._path_cache[key] = bitpaths.shortest_path(m, cell, player)
+            if len(cache) >= self._small_limit:
+                cache.clear()
+            p = cache[key] = bitpaths.shortest_path(m, cell, player)
         return p
 
     def dist(self, state: GameState, player: int) -> int | None:
@@ -202,7 +289,7 @@ class Searcher:
             # path part of is_wall_legal holds; only the cheap part is left to check.
             if wall_fits(state, w):
                 child = apply_move_unchecked(state, w)
-                self._mask_cache[(child.h_walls, child.v_walls)] = cm
+                self._store_masks((child.h_walls, child.v_walls), cm)
                 out.append((gain, w, child))
                 if len(out) >= self.wall_limit:
                     break
@@ -251,7 +338,7 @@ class Searcher:
                 me_after = self.dist_m(cm, my_cell, me)
                 if op_after is None or me_after is None:
                     continue  # cuts someone off: illegal
-                self._mask_cache[(child.h_walls, child.v_walls)] = cm
+                self._store_masks((child.h_walls, child.v_walls), cm)
                 scored.append(((op_after - d_op) - (me_after - d_me), w, child))
         scored.sort(key=lambda t: -t[0])
         return scored
@@ -294,11 +381,13 @@ class Searcher:
         good: list[PawnMove],
         walls: list[tuple[int, WallMove, GameState]] | None,
         other: list[PawnMove],
+        skip_wall: WallMove | None = None,
     ) -> Iterator[tuple[Move, GameState]]:
         """(move, child): `first`, good pawn moves, walls, other pawn moves.
 
         Lazy: children are built only when reached, and candidate walls (the expensive
-        part) are generated only if no earlier move gave a cutoff.
+        part) are generated only if no earlier move gave a cutoff. `skip_wall` is a wall
+        already yielded in `first` without generating the walls (the TT move).
         """
         yield from first
         for m in good:
@@ -306,13 +395,21 @@ class Searcher:
         if walls is None:
             walls = self.candidate_walls(state)
         for _, w, child in walls:
+            if w == skip_wall:
+                continue
             yield w, child
         for m in other:
             yield m, apply_move_unchecked(state, m)
 
     # ---------- tree ----------
 
-    def _negamax(self, state: GameState, depth: int, alpha: int, beta: int, ply: int) -> int:
+    def _negamax(
+        self, state: GameState, depth: int, alpha: int, beta: int, ply: int, key: int = 0
+    ) -> int:
+        """Fail-soft negamax value of `state` for its side to move.
+
+        `key` = zobrist(state); used only when the transposition table is on.
+        """
         self.nodes += 1
         if (
             self._deadline is not None
@@ -331,14 +428,51 @@ class Searcher:
                 return WIN - ply - 1
         if depth <= 0:
             return self.evaluate(state)
+        tt = self._tt
+        tt_move: Move | None = None
+        if tt is not None:
+            e = tt[key & self._tt_mask]
+            if e is not None and e[0] == key:
+                tt_move = e[4]
+                if e[1] == depth:  # same depth only: the value equals the one without TT
+                    v = _from_tt(e[2], ply)
+                    bound = e[3]
+                    if (
+                        bound == EXACT
+                        or (bound == LOWER and v >= beta)
+                        or (bound == UPPER and v <= alpha)
+                    ):
+                        return v
+        alpha0 = alpha
         # Order of ordered_moves, except that the killer of this ply (the last move that
         # gave a cutoff here) goes first if it is in the move set. The set itself is
         # unchanged, so the value of the node is the same; only the work differs.
+        # A killer wall forces the wall generation up front (membership in the pruned
+        # set needs the full ranking). Measured alternative "good pawn moves first, then
+        # the killer wall" (report 0035): +25..48% nodes and slower at d5-d6, so not used.
         good, other = self._pawn_order(state, pawns)
         killer = self._killers[ply]
         walls: list[tuple[int, WallMove, GameState]] | None = None
         first: list[tuple[Move, GameState]] = []
-        if killer is not None:
+        skip_wall: WallMove | None = None
+        # The TT move (best move stored for this very state) goes first. It came from
+        # this state's own move set, which depends on the state only, so a wall needs no
+        # candidate generation; wall_fits guards against a key collision (~2**-64).
+        if tt_move is not None:
+            if isinstance(tt_move, PawnMove):
+                if tt_move in good:
+                    good.remove(tt_move)
+                    first.append((tt_move, apply_move_unchecked(state, tt_move)))
+                elif tt_move in other:
+                    other.remove(tt_move)
+                    first.append((tt_move, apply_move_unchecked(state, tt_move)))
+            elif state.walls_left[state.turn] > 0 and wall_fits(state, tt_move):
+                child = apply_move_unchecked(state, tt_move)
+                cm = add_wall(self.masks(state), tt_move.x, tt_move.y, tt_move.orient)
+                self._store_masks((child.h_walls, child.v_walls), cm)
+                first.append((tt_move, child))
+                skip_wall = tt_move
+        if killer is not None and killer != tt_move:
             if isinstance(killer, PawnMove):
                 if killer in good:
                     good.remove(killer)
@@ -354,17 +488,25 @@ class Searcher:
                         del walls[j]
                         break
         best = -INF
-        for mv, child in self._children(state, first, good, walls, other):
-            v = -self._negamax(child, depth - 1, -beta, -alpha, ply + 1)
+        best_move: Move | None = None
+        for mv, child in self._children(state, first, good, walls, other, skip_wall):
+            ck = child_key(key, state, mv) if tt is not None else 0
+            v = -self._negamax(child, depth - 1, -beta, -alpha, ply + 1, ck)
             if v > best:
                 best = v
+                best_move = mv
                 if v > alpha:
                     alpha = v
                     if alpha >= beta:
                         self._killers[ply] = mv
-                        return best
+                        break
         if best == -INF:  # boxed in, no useful wall: treat as quiet
-            return self.evaluate(state)
+            best = self.evaluate(state)
+            bound = EXACT
+        else:
+            bound = UPPER if best <= alpha0 else LOWER if best >= beta else EXACT
+        if tt is not None:
+            tt[key & self._tt_mask] = (key, depth, _to_tt(best, ply), bound, best_move)
         return best
 
     def search(
@@ -376,8 +518,21 @@ class Searcher:
         """Best move for state.turn. At least depth 1 is always completed.
 
         `time_limit` is a hard limit for depths >= 2; a new iteration is not started
-        after half of it is used (it would most likely not finish).
+        after half of it is used (it would most likely not finish). The memo caches are
+        freed on return, so nothing big is held between moves.
         """
+        try:
+            return self._search(state, max_depth, time_limit)
+        finally:
+            self._dist_cache = {}
+            self._mask_cache = {}
+            self._path_cache = {}
+            self._tt = None
+            self._deadline = None
+
+    def _search(
+        self, state: GameState, max_depth: int | None, time_limit: float | None
+    ) -> SearchResult:
         if winner(state) is not None:
             raise ValueError("no legal moves (terminal position)")
         if max_depth is None and time_limit is None:
@@ -390,6 +545,8 @@ class Searcher:
         self._mask_cache = {}
         self._path_cache = {}
         self._deadline = None
+        use_tt = self.tt_bits > 0 and max(state.walls_left) < _ZMAX_WALLS
+        self._tt = [None] * (1 << self.tt_bits) if use_tt else None
 
         pawns = pawn_moves(state)
         goal = goal_row(state.turn)
@@ -405,6 +562,8 @@ class Searcher:
         self._rng.shuffle(order)
         prio = {i: rank for rank, i in enumerate(order)}
         idx = list(range(len(root)))
+        rk = zobrist(state) if use_tt else 0
+        keys = [child_key(rk, state, m) if use_tt else 0 for m, _ in root]
         best_move: Move = root[0][0]
         best_score = -INF
         done_depth = 0
@@ -420,7 +579,7 @@ class Searcher:
             scores = [-INF] * len(root)
             try:
                 for i in idx:
-                    v = -self._negamax(root[i][1], depth - 1, -INF, -alpha, 1)
+                    v = -self._negamax(root[i][1], depth - 1, -INF, -alpha, 1, keys[i])
                     scores[i] = v  # exact if > alpha, otherwise an upper bound
                     if iter_best_i < 0 or v > alpha:
                         alpha = v

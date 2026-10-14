@@ -2,7 +2,9 @@
 
 Terms (in centi-steps, 100 = one step of shortest path):
   * path race: STEP * (opponent distance - own distance);
-  * wall stock: WALL * (own walls left - opponent walls left);
+  * wall stock: wall_weight * (own walls left - opponent walls left); WALL (25) is the
+    v1/v2 weight, WALL_V3 (125) the v3 one: a wall in stock is worth more than a step, so
+    a wall that wins only one step is not spent (equal-time matches, report 0037);
   * walls-out races: when one side has no walls left, the race is (almost) decided by
     the distances alone, so a clear race gets a large bonus RACE (jumps are ignored,
     which is why it is not a proven WIN).
@@ -18,7 +20,8 @@ from quoridor.state import GameState
 
 WIN = 1_000_000  # mate score; the search uses WIN - ply
 STEP = 100
-WALL = 25
+WALL = 25  # v1 / v2 (phase 4)
+WALL_V3 = 125  # v3: tuned at equal time (0.2 s/move), see report 0037
 RACE = 5_000
 
 DistFn = Callable[[GameState, int], int | None]

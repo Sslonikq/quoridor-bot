@@ -1,4 +1,4 @@
-"""Bots: random, greedy and the alpha-beta bot v1.
+"""Bots: random, greedy, the alpha-beta bots and frozen baselines (quoridor.frozen).
 
 No I/O, no global state (each bot owns its random.Random). SearchBot reads the clock only
 when it has a time limit; with a fixed depth and no time limit it is fully deterministic.
@@ -11,10 +11,11 @@ import time
 from collections.abc import Callable, Mapping
 from typing import Protocol
 
-from quoridor.eval import WALL
+from quoridor.eval import WALL, WALL_V3
+from quoridor.frozen import search_v1
 from quoridor.paths import shortest_path, shortest_path_length
 from quoridor.rules import apply_move_unchecked, is_wall_legal, legal_moves, pawn_moves
-from quoridor.search import DEFAULT_WALL_LIMIT, Searcher, SearchResult
+from quoridor.search import DEFAULT_WALL_LIMIT, V2_TT_BITS, Searcher, SearchResult
 from quoridor.state import (
     WALL_GRID,
     Cell,
@@ -136,6 +137,12 @@ class GreedyBot:
         return self._rng.choice(best_pawn)
 
 
+class SearcherLike(Protocol):
+    def search(
+        self, state: GameState, max_depth: int | None = None, time_limit: float | None = None
+    ) -> SearchResult: ...
+
+
 class SearchBot:
     """Alpha-beta + iterative deepening (quoridor.search) with the eval of quoridor.eval.
 
@@ -143,6 +150,7 @@ class SearchBot:
       depth     -- max search depth in plies (fixed depth + no time = deterministic);
       move_time -- seconds per move;
       game_time -- own clock for the whole game: per-move budget from quoridor.timeman.
+    tt_bits > 0 turns on the transposition table of 2**tt_bits entries (v2).
     The seed only breaks ties between equally scored root moves.
     """
 
@@ -154,13 +162,21 @@ class SearchBot:
         game_time: float | None = None,
         wall_limit: int = DEFAULT_WALL_LIMIT,
         wall_weight: int = WALL,
+        searcher: SearcherLike | None = None,
+        tt_bits: int = 0,
     ) -> None:
         if depth is None and move_time is None and game_time is None:
             raise ValueError("SearchBot needs depth, move_time or game_time")
         self.depth = depth
         self.move_time = move_time
         self.game_time = game_time
-        self._searcher = Searcher(seed, wall_limit=wall_limit, wall_weight=wall_weight)
+        # `searcher` replaces the default Searcher (e.g. a frozen older version); then
+        # seed, wall_limit and wall_weight are the injected searcher's business.
+        self._searcher: SearcherLike = (
+            Searcher(seed, wall_limit=wall_limit, wall_weight=wall_weight, tt_bits=tt_bits)
+            if searcher is None
+            else searcher
+        )
         self.used = 0.0  # seconds spent in choose_move this game
         self.moves = 0
         self.last: SearchResult | None = None
@@ -193,6 +209,62 @@ def make_v1_clock(seed: int) -> SearchBot:
     return SearchBot(seed, game_time=GAME_TIME)
 
 
+def make_v1_frozen(seed: int) -> SearchBot:
+    """v1 exactly as at the end of phase 5 (quoridor/frozen/search_v1.py), depth V1_DEPTH.
+
+    A fixed baseline: unlike "v1" it does not change when search.py / eval.py do.
+    """
+    return SearchBot(seed, depth=V1_DEPTH, searcher=search_v1.Searcher(seed))
+
+
+V2_DEPTH = V1_DEPTH  # same depth as v1: at a fixed depth the TT changes no score, only speed
+FAST_MOVE_TIME = 0.2  # seconds per move for the equal-time matches "v1-0.2s" vs "v2-0.2s"
+
+
+def make_v2(seed: int) -> SearchBot:
+    """v1 + transposition table (search.V2_TT_BITS), fixed depth V2_DEPTH."""
+    return SearchBot(seed, depth=V2_DEPTH, tt_bits=V2_TT_BITS)
+
+
+def make_v2_clock(seed: int) -> SearchBot:
+    """v2 on a 10-minute game clock."""
+    return SearchBot(seed, game_time=GAME_TIME, tt_bits=V2_TT_BITS)
+
+
+V3_DEPTH = V1_DEPTH  # fixed-depth variant for deterministic tests; strength is at equal time
+V3_WALL_WEIGHT = WALL_V3
+
+
+def make_v3(seed: int) -> SearchBot:
+    """v2 (TT) + the v3 eval (wall stock weight WALL_V3), fixed depth V3_DEPTH."""
+    return SearchBot(seed, depth=V3_DEPTH, tt_bits=V2_TT_BITS, wall_weight=V3_WALL_WEIGHT)
+
+
+def make_v3_clock(seed: int) -> SearchBot:
+    """v3 on a 10-minute game clock (the version for real games)."""
+    return SearchBot(seed, game_time=GAME_TIME, tt_bits=V2_TT_BITS, wall_weight=V3_WALL_WEIGHT)
+
+
+def make_v3_fast(seed: int) -> SearchBot:
+    """v3 with FAST_MOVE_TIME per move (equal-time comparison; not deterministic)."""
+    return SearchBot(seed, move_time=FAST_MOVE_TIME, tt_bits=V2_TT_BITS, wall_weight=V3_WALL_WEIGHT)
+
+
+def make_v1_frozen_fast(seed: int) -> SearchBot:
+    """The frozen v1 with FAST_MOVE_TIME per move: an equal-time baseline that never changes."""
+    return SearchBot(seed, move_time=FAST_MOVE_TIME, searcher=search_v1.Searcher(seed))
+
+
+def make_v1_fast(seed: int) -> SearchBot:
+    """v1 with FAST_MOVE_TIME per move (equal-time comparison; not deterministic)."""
+    return SearchBot(seed, move_time=FAST_MOVE_TIME)
+
+
+def make_v2_fast(seed: int) -> SearchBot:
+    """v2 with FAST_MOVE_TIME per move (equal-time comparison; not deterministic)."""
+    return SearchBot(seed, move_time=FAST_MOVE_TIME, tt_bits=V2_TT_BITS)
+
+
 # Single source of truth for the move limit and the bot registry (used by cli and arena).
 DEFAULT_MAX_MOVES = 300
 BotFactory = Callable[[int], Bot]
@@ -203,6 +275,15 @@ BOTS: dict[str, BotFactory] = {
     "greedy": GreedyBot,
     "v1": make_v1,
     "v1-clock": make_v1_clock,
+    "v1-frozen": make_v1_frozen,
+    "v1-0.2s": make_v1_fast,
+    "v2": make_v2,
+    "v2-clock": make_v2_clock,
+    "v2-0.2s": make_v2_fast,
+    "v1-frozen-0.2s": make_v1_frozen_fast,
+    "v3": make_v3,
+    "v3-clock": make_v3_clock,
+    "v3-0.2s": make_v3_fast,
 }
 # Bots whose play does not depend on the seed in a meaningful way (seed only breaks ties):
 # a mirror match of such a bot repeats the same game.
