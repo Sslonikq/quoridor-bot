@@ -14,7 +14,15 @@ import functools
 import pytest
 
 from quoridor.bots import BOTS, V2_DEPTH, make_bot
-from quoridor.rules import apply_move_unchecked, is_legal_move, is_terminal, legal_moves
+from quoridor.rules import (
+    apply_move_unchecked,
+    is_legal_move,
+    is_terminal,
+    is_wall_legal,
+    legal_moves,
+    pawn_moves,
+    wall_fits,
+)
 from quoridor.search import (
     INF,
     V2_TT_BITS,
@@ -25,7 +33,7 @@ from quoridor.search import (
     is_win_score,
     zobrist,
 )
-from quoridor.state import GameState
+from quoridor.state import WALL_GRID, GameState, H, V, WallMove, goal_row
 from tests.playouts import random_game
 from tests.search.test_search_defence import fast_threat_positions
 
@@ -142,6 +150,47 @@ def test_tt_saves_work_at_depth_5():
     plain = sum(Searcher(0).search(s, max_depth=5).nodes for s in ps)
     tt = sum(Searcher(0, tt_bits=V2_TT_BITS).search(s, max_depth=5).nodes for s in ps)
     assert tt < plain
+
+
+# ---------- key collision: a foreign TT move ----------
+
+
+def _cutting_wall_position():
+    """A position (walls left, no win in 1) and a wall that fits but cuts someone off."""
+    for seed in range(200, 260):
+        for s in random_game(seed, max_plies=80, wall_bias=0.9):
+            if is_terminal(s) or s.walls_left[s.turn] == 0:
+                continue
+            if any(m.row == goal_row(s.turn) for m in pawn_moves(s)):
+                continue
+            for x in range(WALL_GRID):
+                for y in range(WALL_GRID):
+                    for o in (H, V):
+                        w = WallMove(x, y, o)
+                        if wall_fits(s, w) and not is_wall_legal(s, w):
+                            return s, w
+    raise AssertionError("no position with a fitting but cutting wall")
+
+
+def test_tt_wall_from_a_key_collision_is_checked_for_paths():
+    """Review 0040, nit 6: a TT wall that fits but cuts a player off is never searched."""
+    s, bad = _cutting_wall_position()
+    sr = Searcher(0, tt_bits=V2_TT_BITS)
+    key = zobrist(s)
+    # A colliding entry: same full key, other depth (no value cutoff), foreign best move.
+    sr._tt = {key & sr._tt_mask: (key, 99, 0, 0, bad)}
+    seen = []
+    orig = sr._negamax
+
+    def spy(state, depth, alpha, beta, ply, k=0):
+        seen.append(state)
+        return orig(state, depth, alpha, beta, ply, k)
+
+    sr._negamax = spy
+    sr._negamax(s, 2, -INF, INF, 0, key)
+    assert len(seen) > 1
+    o = bad.orient
+    assert all((bad.x, bad.y) not in (c.h_walls if o == H else c.v_walls) for c in seen)
 
 
 # ---------- ownership ----------

@@ -1,7 +1,7 @@
 """Reproducible search benchmark (phase 5).
 
 Run:  python -m tests.perf.bench_search [--depths 3 4 5] [--repeat 3] [--tt-bits B]
-                                        [--time 0.5] [--memory 15]
+                                        [--wall-weight W] [--time 0.5] [--memory 15]
 
 Positions are fixed: every 3rd ply of seeded random games (tests.playouts), terminal and
 forced-win positions dropped. For each depth it prints ms per position, nodes per position
@@ -10,6 +10,7 @@ speed of the bitboard BFS against the reference BFS in quoridor.paths.
 --time T: average completed depth with time_limit=T over all positions.
 --memory T: peak memory of one search with time_limit=T on a fixed middlegame position,
 measured in a fresh child process (peak working set / max RSS of that process).
+--tt-bits / --wall-weight: Searcher parameters (v3 = --tt-bits 18 --wall-weight 125).
 Absolute numbers depend on the machine; compare runs taken back to back.
 """
 
@@ -60,19 +61,30 @@ class DepthStat:
         return self.nodes / self.seconds
 
 
-def make_searcher(tt_bits: int | None = None) -> Searcher:
-    """Searcher(0); tt_bits=None keeps the Searcher default."""
-    return Searcher(0) if tt_bits is None else Searcher(0, tt_bits=tt_bits)
+def make_searcher(tt_bits: int | None = None, wall_weight: int | None = None) -> Searcher:
+    """Searcher(0); None keeps the Searcher default for that parameter."""
+    kw: dict[str, int] = {}
+    if tt_bits is not None:
+        kw["tt_bits"] = tt_bits
+    if wall_weight is not None:
+        kw["wall_weight"] = wall_weight
+    return Searcher(0, **kw)
 
 
-def bench_depth(positions, depth: int, repeat: int = 3, tt_bits: int | None = None) -> DepthStat:
+def bench_depth(
+    positions,
+    depth: int,
+    repeat: int = 3,
+    tt_bits: int | None = None,
+    wall_weight: int | None = None,
+) -> DepthStat:
     best = float("inf")
     nodes = 0
     for _ in range(repeat):
         n = 0
         t0 = time.perf_counter()
         for s in positions:
-            n += make_searcher(tt_bits).search(s, max_depth=depth).nodes
+            n += make_searcher(tt_bits, wall_weight).search(s, max_depth=depth).nodes
         dt = time.perf_counter() - t0
         best = min(best, dt)
         nodes = n
@@ -135,10 +147,10 @@ def peak_rss_bytes() -> int:
     return peak if sys.platform == "darwin" else peak * 1024  # Linux reports KiB
 
 
-def memory_child(time_limit: float, tt_bits: int | None) -> dict:
+def memory_child(time_limit: float, tt_bits: int | None, wall_weight: int | None = None) -> dict:
     """Runs in the child process: one timed search, returns the peak memory figures."""
     s = bench_positions()[MEMORY_POSITION]
-    sr = make_searcher(tt_bits)
+    sr = make_searcher(tt_bits, wall_weight)
     before = peak_rss_bytes()
     r = sr.search(s, time_limit=time_limit)
     return {
@@ -150,18 +162,25 @@ def memory_child(time_limit: float, tt_bits: int | None) -> dict:
     }
 
 
-def bench_memory(time_limit: float, tt_bits: int | None) -> dict:
+def bench_memory(time_limit: float, tt_bits: int | None, wall_weight: int | None = None) -> dict:
     """memory_child in a fresh interpreter, so the peak belongs to this search only."""
     cmd = [sys.executable, "-m", "tests.perf.bench_search", "--memory-child", str(time_limit)]
     if tt_bits is not None:
         cmd += ["--tt-bits", str(tt_bits)]
+    if wall_weight is not None:
+        cmd += ["--wall-weight", str(wall_weight)]
     out = subprocess.run(cmd, capture_output=True, text=True, check=True).stdout
     return json.loads(out.strip().splitlines()[-1])
 
 
-def bench_time_depth(positions, time_limit: float, tt_bits: int | None = None) -> float:
+def bench_time_depth(
+    positions, time_limit: float, tt_bits: int | None = None, wall_weight: int | None = None
+) -> float:
     """Average completed depth with a time limit (machine-dependent)."""
-    depths = [make_searcher(tt_bits).search(s, time_limit=time_limit).depth for s in positions]
+    depths = [
+        make_searcher(tt_bits, wall_weight).search(s, time_limit=time_limit).depth
+        for s in positions
+    ]
     return sum(depths) / len(depths)
 
 
@@ -170,17 +189,20 @@ def main(argv=None) -> int:
     ap.add_argument("--depths", type=int, nargs="+", default=[3, 4, 5])
     ap.add_argument("--repeat", type=int, default=3)
     ap.add_argument("--tt-bits", type=int, default=None, help="Searcher(tt_bits=...)")
+    ap.add_argument(
+        "--wall-weight", type=int, default=None, help="Searcher(wall_weight=...), v3: 125"
+    )
     ap.add_argument("--time", type=float, default=None, help="depth at this time limit")
     ap.add_argument("--memory", type=float, default=None, help="peak memory at this limit")
     ap.add_argument("--memory-child", type=float, default=None, help=argparse.SUPPRESS)
     args = ap.parse_args(argv)
     if args.memory_child is not None:
-        print(json.dumps(memory_child(args.memory_child, args.tt_bits)))
+        print(json.dumps(memory_child(args.memory_child, args.tt_bits, args.wall_weight)))
         return 0
     ps = bench_positions()
     print(f"positions: {len(ps)}")
     for d in args.depths:
-        st = bench_depth(ps, d, args.repeat, args.tt_bits)
+        st = bench_depth(ps, d, args.repeat, args.tt_bits, args.wall_weight)
         print(
             f"d{d}: {st.ms_per_position:8.1f} ms/pos  {st.nodes / st.positions:9.0f} nodes/pos"
             f"  {st.nps / 1000:6.1f}k nodes/s"
@@ -191,10 +213,10 @@ def main(argv=None) -> int:
         f" (x{ref / fast:.1f})"
     )
     if args.time is not None:
-        avg = bench_time_depth(ps, args.time, args.tt_bits)
+        avg = bench_time_depth(ps, args.time, args.tt_bits, args.wall_weight)
         print(f"depth at {args.time} s: {avg:.2f} (average over {len(ps)} positions)")
     if args.memory is not None:
-        m = bench_memory(args.memory, args.tt_bits)
+        m = bench_memory(args.memory, args.tt_bits, args.wall_weight)
         print(
             f"memory at {args.memory} s: peak {m['peak_mb']:.0f} MB (before search "
             f"{m['base_mb']:.0f} MB), depth {m['depth']}, {m['nodes']} nodes, "

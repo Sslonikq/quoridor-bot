@@ -20,13 +20,15 @@
   parent's moves. The memo caches are bounded (cleared when full, see cache_limit) and
   freed when search() returns. Candidate walls are scored on child masks without building a child
   state; states are built only for the kept walls.
-* Transposition table (v2, tt_bits > 0): a fixed-size list owned by the Searcher,
+* Transposition table (v2, tt_bits > 0): 2**tt_bits slots owned by the Searcher,
   indexed by an incremental Zobrist key (pawns, walls, walls left, side to move), entry =
   (key, depth, value, bound, best move); always-replace. Values are reused only from
   entries of exactly the same remaining depth (and mate scores are stored relative to
   the node), so with a fixed depth the search returns the same scores as without the
-  table; entries of any depth give their best move, which is tried first. The table is
-  rebuilt empty at every search() and dropped on return.
+  table; entries of any depth give their best move, which is tried first. The slots are
+  a dict {slot index: entry}, filled lazily: a new search() starts with an empty dict
+  (no 2**tt_bits allocation per move, report 0043) and it is dropped on return. The
+  replacement scheme is the same as a fixed-size list, so the results are too.
 * Limits: fixed depth (deterministic, for the arena/tests) and/or a time budget. On
   timeout the result of the last completed iteration (or a fully searched improvement
   from the current one) is returned. Root ties are broken by a seeded shuffle.
@@ -180,7 +182,7 @@ class Searcher:
         self.cache_limit = max(1, cache_limit)
         self._small_limit = max(1, cache_limit // 4)
         self.tt_bits = max(0, tt_bits)  # 0: no transposition table (v1)
-        self._tt: list[tuple | None] | None = None  # allocated per search()
+        self._tt: dict[int, tuple] | None = None  # slot -> entry, empty at every search()
         self._tt_mask = (1 << self.tt_bits) - 1
         self._dist_cache: dict[tuple, int | None] = {}
         self._mask_cache: dict[tuple, Masks] = {}
@@ -431,7 +433,7 @@ class Searcher:
         tt = self._tt
         tt_move: Move | None = None
         if tt is not None:
-            e = tt[key & self._tt_mask]
+            e = tt.get(key & self._tt_mask)
             if e is not None and e[0] == key:
                 tt_move = e[4]
                 if e[1] == depth:  # same depth only: the value equals the one without TT
@@ -457,7 +459,9 @@ class Searcher:
         skip_wall: WallMove | None = None
         # The TT move (best move stored for this very state) goes first. It came from
         # this state's own move set, which depends on the state only, so a wall needs no
-        # candidate generation; wall_fits guards against a key collision (~2**-64).
+        # candidate generation. On a full 64-bit key collision (~2**-64) the move may be
+        # foreign to this state, so a TT wall gets the whole is_wall_legal check: wall_fits
+        # plus a path for both players on the child masks (cached BFS, TT move only).
         if tt_move is not None:
             if isinstance(tt_move, PawnMove):
                 if tt_move in good:
@@ -467,11 +471,16 @@ class Searcher:
                     other.remove(tt_move)
                     first.append((tt_move, apply_move_unchecked(state, tt_move)))
             elif state.walls_left[state.turn] > 0 and wall_fits(state, tt_move):
-                child = apply_move_unchecked(state, tt_move)
                 cm = add_wall(self.masks(state), tt_move.x, tt_move.y, tt_move.orient)
-                self._store_masks((child.h_walls, child.v_walls), cm)
-                first.append((tt_move, child))
-                skip_wall = tt_move
+                me = state.turn
+                if (
+                    self.dist_m(cm, state.pawns[me], me) is not None
+                    and self.dist_m(cm, state.pawns[1 - me], 1 - me) is not None
+                ):
+                    child = apply_move_unchecked(state, tt_move)
+                    self._store_masks((child.h_walls, child.v_walls), cm)
+                    first.append((tt_move, child))
+                    skip_wall = tt_move
         if killer is not None and killer != tt_move:
             if isinstance(killer, PawnMove):
                 if killer in good:
@@ -489,8 +498,11 @@ class Searcher:
                         break
         best = -INF
         best_move: Move | None = None
+        # Children of a depth-1 node are leaves (depth 0): they never probe or store the
+        # table, so their key is not needed.
+        need_key = tt is not None and depth > 1
         for mv, child in self._children(state, first, good, walls, other, skip_wall):
-            ck = child_key(key, state, mv) if tt is not None else 0
+            ck = child_key(key, state, mv) if need_key else 0
             v = -self._negamax(child, depth - 1, -beta, -alpha, ply + 1, ck)
             if v > best:
                 best = v
@@ -546,7 +558,7 @@ class Searcher:
         self._path_cache = {}
         self._deadline = None
         use_tt = self.tt_bits > 0 and max(state.walls_left) < _ZMAX_WALLS
-        self._tt = [None] * (1 << self.tt_bits) if use_tt else None
+        self._tt = {} if use_tt else None  # lazily filled slots, at most 2**tt_bits
 
         pawns = pawn_moves(state)
         goal = goal_row(state.turn)
