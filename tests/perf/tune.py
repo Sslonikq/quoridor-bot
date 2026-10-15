@@ -11,7 +11,8 @@ If move_time/depth/game_time is absent in a `search:`/`frozen:` spec, --move-tim
 The games are split between --procs processes (seeds seed, seed+1, ...; colours alternate
 inside every chunk, as in the arena). Both sides play under the same machine load, so the
 result is a comparison at equal time. Prints W/L/D for A, score with the 95% Wilson interval,
-average move time and the wall time of the run. No network, nothing is written to disk.
+average move time and plies (weighted by games per process) and the wall time of the run.
+No network, nothing is written to disk.
 """
 
 from __future__ import annotations
@@ -47,7 +48,32 @@ def parse_spec(spec: str, default_move_time: float) -> BotFactory:
             return SearchBot(seed, searcher=search_v1.Searcher(seed), **kw)  # type: ignore[arg-type]
         return SearchBot(seed, **kw)  # type: ignore[arg-type]
 
+    # Build one bot now: an unknown key or a setting that SearchBot would ignore (e.g.
+    # frozen:tt_bits=18, review 0040 minor 2) fails here, in the parent, before any game.
+    try:
+        factory(0)
+    except TypeError as e:
+        raise ValueError(f"bad parameters in {spec!r}: {e}") from e
     return factory
+
+
+def combine(results: list[tuple]) -> tuple[int, int, int, float, float, float]:
+    """Sum W/L/D over the chunks; average move times and plies weighted by games per chunk.
+
+    Chunks differ in size when games % procs != 0 (review 0040, nit 9), so a plain mean
+    of the chunk averages would overweight the smaller chunks.
+    """
+    w = sum(r[0] for r in results)
+    lo = sum(r[1] for r in results)
+    d = sum(r[2] for r in results)
+    n = w + lo + d
+    if n == 0:
+        return 0, 0, 0, 0.0, 0.0, 0.0
+
+    def avg(i: int) -> float:
+        return sum(r[i] * (r[0] + r[1] + r[2]) for r in results) / n
+
+    return w, lo, d, avg(3), avg(4), avg(5)
 
 
 def _job(args: tuple[str, str, float, int, int, int]):
@@ -79,14 +105,9 @@ def main(argv: list[str] | None = None) -> int:
     t0 = time.perf_counter()
     with ProcessPoolExecutor(procs) as ex:
         res = list(ex.map(_job, jobs))
-    w = sum(r[0] for r in res)
-    lo = sum(r[1] for r in res)
-    d = sum(r[2] for r in res)
+    w, lo, d, ta, tb, pl = combine(res)
     n = w + lo + d
     lo_ci, hi_ci = wilson_interval(w + d / 2, n) if n else (0.0, 0.0)
-    ta = sum(r[3] for r in res) / len(res)
-    tb = sum(r[4] for r in res) / len(res)
-    pl = sum(r[5] for r in res) / len(res)
     print(f"{ns.a} vs {ns.b}: W {w} L {lo} D {d} n={n}")
     print(
         f"score {100 * (w + d / 2) / max(n, 1):.1f}%  "

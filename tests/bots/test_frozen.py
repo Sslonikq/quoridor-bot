@@ -30,6 +30,28 @@ def test_registry_has_frozen_baseline():
     assert isinstance(bot._searcher, search_v1.Searcher)
 
 
+@pytest.mark.parametrize(
+    "kw",
+    [{"tt_bits": 18}, {"wall_weight": 125}, {"wall_limit": 3}, {"tt_bits": 1, "wall_limit": 1}],
+)
+def test_searchbot_rejects_settings_ignored_with_injected_searcher(kw):
+    """Review 0040, minor 2: non-default Searcher settings next to searcher= are an error."""
+    with pytest.raises(ValueError, match="ignored with searcher="):
+        bots.SearchBot(0, depth=1, searcher=search_v1.Searcher(0), **kw)
+
+
+def test_searchbot_accepts_defaults_with_injected_searcher():
+    b = bots.SearchBot(
+        0,
+        depth=1,
+        searcher=search_v1.Searcher(0),
+        tt_bits=0,
+        wall_weight=bots.WALL,
+        wall_limit=bots.DEFAULT_WALL_LIMIT,
+    )
+    assert isinstance(b._searcher, search_v1.Searcher)
+
+
 def test_frozen_imports_only_rules_level_modules():
     tree = ast.parse(FROZEN.read_text(encoding="utf-8"))
     mods = {

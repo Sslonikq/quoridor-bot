@@ -171,7 +171,24 @@ class SearchBot:
         self.move_time = move_time
         self.game_time = game_time
         # `searcher` replaces the default Searcher (e.g. a frozen older version); then
-        # seed, wall_limit and wall_weight are the injected searcher's business.
+        # seed, wall_limit, wall_weight and tt_bits are the injected searcher's business.
+        # Non-default values next to `searcher` would be silently ignored, so they are an
+        # error (review 0040, minor 2: "frozen:tt_bits=18" must not run as plain v1).
+        if searcher is not None:
+            ignored = [
+                name
+                for name, val, default in (
+                    ("wall_limit", wall_limit, DEFAULT_WALL_LIMIT),
+                    ("wall_weight", wall_weight, WALL),
+                    ("tt_bits", tt_bits, 0),
+                )
+                if val != default
+            ]
+            if ignored:
+                raise ValueError(
+                    f"SearchBot: {', '.join(ignored)} would be ignored with searcher=; "
+                    "configure the injected searcher instead"
+                )
         self._searcher: SearcherLike = (
             Searcher(seed, wall_limit=wall_limit, wall_weight=wall_weight, tt_bits=tt_bits)
             if searcher is None
