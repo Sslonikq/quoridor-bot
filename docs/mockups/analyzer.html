@@ -1,0 +1,440 @@
+<title>Анализатор Коридора</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Onest:wght@400;500;700&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: слева шкала оценки + доска + график, справа панель (лучшие ходы, партия, загрузка). Один тёмный вид, как у игрового сайта. */
+:root{
+  --bg:#0d0f12; --panel:#16191e; --panel-2:#1d2127; --line:#2a2f37;
+  --cell:#20242a; --cell-alt:#1b1e23; --gap:#121418;
+  --fg:#e7e9ec; --muted:#8b929c; --faint:#5b616b;
+  --wall:#e9a42f; --hint:#2ecc71; --hint-soft:rgba(46,204,113,.22); --bad:#e5534b;
+  --white-pawn:#f2f2f2; --black-pawn:#0b0b0b;
+  --blunder:#e5534b; --mistake:#f08c3a; --inacc:#e6c547; --best:#2ecc71;
+  --f-ui:"Onest",system-ui,-apple-system,"Segoe UI",sans-serif;
+  --f-mono:"JetBrains Mono",ui-monospace,Consolas,monospace;
+  color-scheme:dark;
+}
+html,body{background:var(--bg);color:var(--fg)}
+body{font-family:var(--f-ui);font-size:14px;padding-block:20px 32px;
+  padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px))}
+.wrap{max-width:1120px;margin:0 auto;display:flex;flex-direction:column;gap:16px}
+header{display:flex;flex-wrap:wrap;align-items:baseline;gap:8px 16px;justify-content:space-between}
+h1{font-size:20px;margin:0;font-weight:700;letter-spacing:.01em}
+.tag{font-size:12px;color:var(--muted)}
+.tag b{color:var(--inacc);font-weight:500}
+.main{display:grid;grid-template-columns:minmax(0,600px) minmax(0,1fr);gap:20px;align-items:start}
+@media (max-width:900px){.main{grid-template-columns:minmax(0,1fr)}}
+.left{display:flex;flex-direction:column;gap:12px;min-width:0}
+.boardrow{display:flex;gap:10px;align-items:stretch}
+.evalbar{width:22px;flex:none;border-radius:4px;overflow:hidden;position:relative;background:var(--black-pawn);border:1px solid var(--line)}
+.evalbar .w{position:absolute;left:0;right:0;bottom:0;background:var(--white-pawn);transition:height .25s}
+.evalbar .num{position:absolute;left:0;right:0;font:600 10px var(--f-mono);text-align:center}
+.boardbox{flex:1;min-width:0;position:relative}
+svg#board{width:100%;height:auto;display:block;touch-action:manipulation;user-select:none}
+.toolbar{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+button,.btn{font:500 13px var(--f-ui);color:var(--fg);background:var(--panel-2);border:1px solid var(--line);border-radius:6px;padding:7px 11px;cursor:pointer}
+button:hover{border-color:#3a414b;background:#232831}
+button:focus-visible,textarea:focus-visible{outline:2px solid var(--hint);outline-offset:2px}
+button.on{border-color:var(--hint);color:var(--hint)}
+button.icon{font-family:var(--f-mono);min-width:36px}
+.sep{flex:1}
+kbd{font:500 11px var(--f-mono);color:var(--muted);border:1px solid var(--line);border-bottom-width:2px;border-radius:4px;padding:0 4px;margin-left:4px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px;display:flex;flex-direction:column;gap:10px;min-width:0}
+.card h2{font-size:12px;margin:0;color:var(--muted);font-weight:500;text-transform:uppercase;letter-spacing:.08em}
+.side{display:flex;flex-direction:column;gap:14px;min-width:0}
+.status{display:grid;grid-template-columns:auto 1fr auto;gap:6px 10px;align-items:center;font-variant-numeric:tabular-nums}
+.dot{width:12px;height:12px;border-radius:50%;border:1px solid #777}
+.dot.w{background:var(--white-pawn)} .dot.b{background:var(--black-pawn)}
+.walls{font-family:var(--f-mono);letter-spacing:1px;color:var(--wall)} .walls i{font-style:normal;color:var(--faint)}
+.dist{color:var(--muted);font-size:13px}
+.turn{font-size:13px;color:var(--muted)} .turn b{color:var(--fg)}
+.best{display:flex;flex-direction:column;gap:6px}
+.bm{display:grid;grid-template-columns:28px 64px 1fr auto;gap:8px;align-items:center;padding:7px 9px;border-radius:6px;background:var(--panel-2);border:1px solid transparent;cursor:pointer;font-variant-numeric:tabular-nums}
+.bm:hover{border-color:var(--line)}
+.bm.top{border-color:var(--hint)}
+.bm .rk{color:var(--faint);font:500 12px var(--f-mono)}
+.bm .mv{font:600 14px var(--f-mono)}
+.bm .why{color:var(--muted);font-size:12px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.bm .ev{font:600 13px var(--f-mono)}
+.hidden-hint{color:var(--muted);font-size:13px}
+.moves{max-height:260px;overflow:auto;display:grid;grid-template-columns:34px 1fr 1fr;gap:2px;font-family:var(--f-mono);font-size:13px;align-content:start}
+.moves .n{color:var(--faint);padding:4px 0}
+.mvc{padding:4px 6px;border-radius:4px;cursor:pointer;display:flex;gap:6px;align-items:center}
+.mvc:hover{background:var(--panel-2)}
+.mvc.cur{background:#26303a;outline:1px solid #3c4a58}
+.mvc.var{color:#9fc3ff}
+.mk{font-weight:600}
+.mk.b{color:var(--blunder)} .mk.m{color:var(--mistake)} .mk.i{color:var(--inacc)} .mk.g{color:var(--best)}
+.summary{display:grid;grid-template-columns:auto 1fr 1fr;gap:4px 12px;font-size:13px;font-variant-numeric:tabular-nums}
+.summary .h{color:var(--muted)}
+.graph{width:100%;height:auto;display:block;cursor:pointer}
+textarea{width:100%;box-sizing:border-box;min-height:70px;resize:vertical;background:var(--gap);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:8px;font:13px var(--f-mono)}
+.msg{font-size:12px;color:var(--muted);min-height:16px}
+.msg.err{color:var(--bad)}
+.legend{font-size:12px;color:var(--muted);display:flex;flex-wrap:wrap;gap:4px 14px}
+.toast{position:fixed;left:50%;bottom:calc(20px + env(safe-area-inset-bottom,0px));transform:translateX(-50%);background:var(--panel-2);border:1px solid var(--line);padding:8px 14px;border-radius:8px;font-size:13px;opacity:0;transition:opacity .2s;pointer-events:none}
+.toast.show{opacity:1}
+/* Компактный режим: окно ~380 px рядом с сайтом игры */
+body.compact{padding-block:10px 12px}
+body.compact .wrap{max-width:380px;gap:10px}
+body.compact header,body.compact .legend,body.compact .graph-card,body.compact .moves-card,body.compact .load-card{display:none}
+body.compact .main{grid-template-columns:minmax(0,1fr);gap:10px}
+body.compact .lbl{display:none}
+body.compact .toolbar{gap:4px}
+body.compact .toolbar button{padding:6px 8px}
+body.compact .sep{flex:1}
+body.compact #bFirst,body.compact #bLast{display:none}
+body.compact .evalbar{width:14px}
+body.compact .evalbar .num{display:none}
+body.compact .boardrow{gap:6px}
+body.compact .turn{font-size:12px}
+body.compact .card{padding:10px;gap:8px}
+body.compact .card h2{display:none}
+body.compact .bm{grid-template-columns:20px 54px 1fr auto;padding:5px 8px}
+body.compact .status{gap:2px 8px;font-size:13px}
+body.compact .walls{font-size:11px}
+body.compact .side{gap:10px}
+@media (prefers-reduced-motion:reduce){*{transition:none!important}}
+</style>
+
+<div class="wrap">
+  <header>
+    <h1>Анализатор Коридора</h1>
+    <span class="tag"><b>Макет.</b> Правила настоящие, оценки упрощённые (на 1 ход вперёд). В проекте их будет считать бот v3. Клавиша C — компактный режим.</span>
+  </header>
+
+  <div class="main">
+    <section class="left">
+      <div class="toolbar">
+        <button class="icon" id="bFirst" title="К началу (Home)">«</button>
+        <button class="icon" id="bPrev" title="Назад (←)">‹</button>
+        <button class="icon" id="bNext" title="Вперёд (→)">›</button>
+        <button class="icon" id="bLast" title="К концу (End)">»</button>
+        <span class="sep"></span>
+        <button id="bUndo" title="Отменить ход (Backspace)">↶<span class="lbl"> Отменить</span></button>
+        <button id="bFlip" title="Перевернуть доску (F)">⇅<span class="lbl"> Перевернуть</span></button>
+        <button id="bHint" class="on" title="Подсказка (H)">💡<span class="lbl" id="hintLbl"> Подсказка: вкл</span></button>
+        <button id="bCompact" title="Компактный режим (C)">▭<span class="lbl"> Компактно</span></button>
+        <button id="bPin" title="Поверх всех окон (в приложении)">📌</button>
+      </div>
+      <div class="boardrow">
+        <div class="evalbar" id="evalbar" aria-label="Шкала оценки"><div class="w" id="evalW"></div><div class="num" id="evalNum"></div></div>
+        <div class="boardbox"><svg id="board" viewBox="0 0 600 600" role="img" aria-label="Доска 9 на 9"></svg></div>
+      </div>
+      <div class="legend">
+        <span>Клик по клетке: ход фишкой.</span>
+        <span>Наведите на щель между клетками: появится стенка, клик ставит её.</span>
+        <span>Ход за обе стороны.</span>
+      </div>
+      <div class="card graph-card">
+        <h2>График партии</h2>
+        <svg class="graph" id="graph" viewBox="0 0 600 120" aria-label="Оценка по ходам"></svg>
+      </div>
+    </section>
+
+    <aside class="side">
+      <div class="card">
+        <div class="status" id="status"></div>
+        <div class="turn" id="turn"></div>
+      </div>
+      <div class="card">
+        <h2>Лучшие ходы</h2>
+        <div class="best" id="best"></div>
+      </div>
+      <div class="card moves-card">
+        <h2>Партия</h2>
+        <div class="moves" id="moves"></div>
+        <div class="summary" id="summary"></div>
+        <div class="toolbar"><button id="bRestore" hidden>Вернуть партию</button><button id="bCopy">Копировать ходы</button><button id="bNew">Новая доска</button></div>
+      </div>
+      <div class="card load-card">
+        <h2>Загрузить партию</h2>
+        <textarea id="pgn" spellcheck="false" placeholder="Вставьте ходы с сайта: d1 e8 c1 e7 …"></textarea>
+        <div class="toolbar"><button id="bLoad">Разобрать</button><span class="msg" id="loadMsg"></span></div>
+      </div>
+    </aside>
+  </div>
+</div>
+<div class="toast" id="toast" role="status"></div>
+
+<script>
+"use strict";
+// ---------- Правила (как в quoridor/: внутренние координаты col,row 0..8; стенки x,y 0..7) ----------
+const N=9, W=0, B=1;
+const GAME01="d1 e8 c1 e7 b1 e6 a1 e5 a2v a4h a2 e4 a3 b3v b3 e3 b2 c2h b1 e2h c1 f3 f3v f5h g5v h4h e4h d5h d1 c3v e1 e3 f1 d3 g1 d4 g2 e4 g3 f4 g2h g3h h6v g4 f4 g3 e4 h3 d4 i3 c4 b5h";
+const initial=()=>({p:[[4,0],[4,8]],h:new Set(),v:new Set(),wl:[10,10],t:W});
+const key=(x,y)=>x*10+y;
+const clone=s=>({p:[s.p[0].slice(),s.p[1].slice()],h:new Set(s.h),v:new Set(s.v),wl:s.wl.slice(),t:s.t});
+function blocked(s,c,r,dc,dr){
+  if(dr===1) return s.h.has(key(c,r))||s.h.has(key(c-1,r));
+  if(dr===-1) return s.h.has(key(c,r-1))||s.h.has(key(c-1,r-1));
+  if(dc===1) return s.v.has(key(c,r))||s.v.has(key(c,r-1));
+  return s.v.has(key(c-1,r))||s.v.has(key(c-1,r-1));
+}
+const inB=(c,r)=>c>=0&&c<N&&r>=0&&r<N;
+const DIRS=[[0,1],[0,-1],[1,0],[-1,0]];
+const goal=pl=>pl===W?N-1:0;
+function dist(s,pl){
+  const [sc,sr]=s.p[pl], g=goal(pl); if(sr===g) return 0;
+  const seen=new Uint8Array(81); seen[sc*9+sr]=1; let q=[[sc,sr]], d=0;
+  while(q.length){ d++; const nq=[];
+    for(const [c,r] of q) for(const [dc,dr] of DIRS){const nc=c+dc,nr=r+dr;
+      if(!inB(nc,nr)||blocked(s,c,r,dc,dr)||seen[nc*9+nr]) continue;
+      if(nr===g) return d; seen[nc*9+nr]=1; nq.push([nc,nr]);}
+    q=nq; }
+  return Infinity;
+}
+function pawnMoves(s){
+  const me=s.p[s.t], op=s.p[1-s.t], out=[];
+  for(const [dc,dr] of DIRS){ const c=me[0]+dc, r=me[1]+dr;
+    if(!inB(c,r)||blocked(s,me[0],me[1],dc,dr)) continue;
+    if(c===op[0]&&r===op[1]){
+      const jc=c+dc, jr=r+dr;
+      if(inB(jc,jr)&&!blocked(s,c,r,dc,dr)) out.push([jc,jr]);
+      else for(const [ec,er] of (dc===0?[[1,0],[-1,0]]:[[0,1],[0,-1]])){
+        const dc2=c+ec, dr2=r+er; if(inB(dc2,dr2)&&!blocked(s,c,r,ec,er)) out.push([dc2,dr2]); }
+    } else out.push([c,r]);
+  }
+  return out;
+}
+function wallFits(s,x,y,o){
+  if(x<0||x>7||y<0||y>7) return false;
+  if(o==="h") return !s.h.has(key(x,y))&&!s.h.has(key(x-1,y))&&!s.h.has(key(x+1,y))&&!s.v.has(key(x,y));
+  return !s.v.has(key(x,y))&&!s.v.has(key(x,y-1))&&!s.v.has(key(x,y+1))&&!s.h.has(key(x,y));
+}
+function wallLegal(s,x,y,o){
+  if(s.wl[s.t]<=0||!wallFits(s,x,y,o)) return false;
+  const n=clone(s); (o==="h"?n.h:n.v).add(key(x,y));
+  return dist(n,W)<Infinity&&dist(n,B)<Infinity;
+}
+function apply(s,m){ const n=clone(s);
+  if(m.k==="p") n.p[s.t]=[m.c,m.r]; else {(m.o==="h"?n.h:n.v).add(key(m.x,m.y)); n.wl[s.t]--;}
+  n.t=1-s.t; return n; }
+const winner=s=>s.p[W][1]===N-1?W:s.p[B][1]===0?B:null;
+function legalMoves(s){
+  if(winner(s)!==null) return [];
+  const out=pawnMoves(s).map(([c,r])=>({k:"p",c,r}));
+  if(s.wl[s.t]>0) for(const o of ["h","v"]) for(let x=0;x<8;x++) for(let y=0;y<8;y++) if(wallLegal(s,x,y,o)) out.push({k:"w",x,y,o});
+  return out;
+}
+// Нотация сайта: якорь = верхняя левая клетка квадрата 2×2 → внутр. (col, row0-1)
+const COLS="abcdefghi";
+function fmt(m){ return m.k==="p"? COLS[m.c]+(m.r+1) : COLS[m.x]+(m.y+2)+m.o; }
+function parse(t){
+  t=t.trim().toLowerCase(); let mm=t.match(/^([a-i])([1-9])([hv])?$/); if(!mm) return null;
+  const c=COLS.indexOf(mm[1]), r=+mm[2]-1;
+  return mm[3]? {k:"w",x:c,y:r-1,o:mm[3]} : {k:"p",c,r};
+}
+const same=(a,b)=>a.k===b.k&&(a.k==="p"? a.c===b.c&&a.r===b.r : a.x===b.x&&a.y===b.y&&a.o===b.o);
+function isLegal(s,m){ return legalMoves(s).some(x=>same(x,m)); }
+
+// ---------- Упрощённая оценка (макет) ----------
+// Оценка в «шагах» с точки зрения белых: разница путей + бонус за ход + немного за стенки в запасе.
+function evalW(s){
+  const w=winner(s); if(w!==null) return w===W?99:-99;
+  return dist(s,B)-dist(s,W)+(s.t===W?0.5:-0.5)+0.25*(s.wl[W]-s.wl[B]);
+}
+function analyse(s){
+  const sign=s.t===W?1:-1, ms=legalMoves(s);
+  const scored=ms.map(m=>{const n=apply(s,m); return {m, e:evalW(n), me:sign*evalW(n), n};});
+  scored.sort((a,b)=>b.me-a.me || (a.m.k==="p"?-1:1));
+  return scored;
+}
+function why(s,x){
+  const dW0=dist(s,W),dB0=dist(s,B),dW=dist(x.n,W),dB=dist(x.n,B);
+  const mine=s.t===W?[dW0,dW]:[dB0,dB], opp=s.t===W?[dB0,dB]:[dW0,dW];
+  if(x.m.k==="p") return mine[1]<mine[0]?`путь ${mine[0]}→${mine[1]}`:`путь не короче (${mine[1]})`;
+  return opp[1]>opp[0]?`соперник ${opp[0]}→${opp[1]}`:"стенка без выигрыша";
+}
+
+// ---------- Состояние анализатора ----------
+let line=[], mainLine=null, ply=0, flipped=false, hintOn=true, hover=null, cache=new Map();
+const states=()=>{ const out=[initial()]; for(const m of line) out.push(apply(out[out.length-1],m)); return out; };
+let ST=[initial()];
+function rebuild(){ ST=states(); cache=new Map(); annotate(); }
+function anal(i){ if(!cache.has(i)) cache.set(i,analyse(ST[i])); return cache.get(i); }
+let marks=[];
+function annotate(){
+  marks=line.map((m,i)=>{ const a=anal(i); if(!a.length) return null;
+    const best=a[0].me, got=a.find(x=>same(x.m,m)); const loss=best-(got?got.me:best);
+    if(loss>=3) return "b"; if(loss>=1.5) return "m"; if(loss>=0.75) return "i"; if(loss<=0.01&&a.length>1&&a[0].me-a[1].me>=1.5) return "g"; return null; });
+}
+const MK={b:"??",m:"?",i:"?!",g:"!"};
+
+// ---------- Отрисовка доски ----------
+const svg=document.getElementById("board"), NS="http://www.w3.org/2000/svg";
+const PAD=24, S=52, G=10, STEP=S+G; // 24 + 9*62 - 10 + 24 = 596
+const el=(n,a,p)=>{const e=document.createElementNS(NS,n); for(const k in a) e.setAttribute(k,a[k]); (p||svg).appendChild(e); return e;};
+const css=v=>getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+const sc=c=>flipped?8-c:c, sr=r=>flipped?r:8-r;               // клетка → экранная колонка/строка
+const gxS=gx=>flipped?9-gx:gx, gyS=gy=>flipped?gy:9-gy;        // линия сетки → экранная
+const X=g=>PAD+g*STEP-G/2, cellX=c=>PAD+sc(c)*STEP, cellY=r=>PAD+sr(r)*STEP;
+function wallRect(x,y,o){ // в экранных координатах
+  if(o==="h"){ const yy=X(gyS(y+1)), a=X(gxS(x)), b=X(gxS(x+2)); const l=Math.min(a,b)+G/2+1, r=Math.max(a,b)-G/2-1; return {x:l,y:yy-G/2+1,w:r-l,h:G-2}; }
+  const xx=X(gxS(x+1)), a=X(gyS(y)), b=X(gyS(y+2)); const t=Math.min(a,b)+G/2+1, bt=Math.max(a,b)-G/2-1; return {x:xx-G/2+1,y:t,w:G-2,h:bt-t};
+}
+function drawBoard(){
+  svg.innerHTML=""; const s=ST[ply], a=anal(ply);
+  el("rect",{x:0,y:0,width:600,height:600,rx:8,fill:css("--gap")});
+  for(let c=0;c<N;c++) for(let r=0;r<N;r++)
+    el("rect",{x:cellX(c),y:cellY(r),width:S,height:S,rx:3,fill:(c+r)%2?css("--cell"):css("--cell-alt")});
+  // подписи
+  for(let c=0;c<N;c++) el("text",{x:cellX(c)+S-5,y:cellY(flipped?8:0)+S-5,"text-anchor":"end","font-size":11,"font-family":"JetBrains Mono, monospace",fill:css("--faint")}).textContent=COLS[c];
+  for(let r=0;r<N;r++) el("text",{x:cellX(flipped?8:0)+5,y:cellY(r)+14,"font-size":11,"font-family":"JetBrains Mono, monospace",fill:css("--faint")}).textContent=r+1;
+  // последний ход
+  if(ply>0){ const m=line[ply-1]; if(m.k==="p") el("rect",{x:cellX(m.c)+1,y:cellY(m.r)+1,width:S-2,height:S-2,rx:3,fill:"none",stroke:"#4a5562","stroke-width":2}); }
+  // легальные шаги фишкой
+  const pm=winner(s)===null?pawnMoves(s):[];
+  for(const [c,r] of pm) el("circle",{cx:cellX(c)+S/2,cy:cellY(r)+S/2,r:6,fill:"#ffffff",opacity:.16,"pointer-events":"none"});
+  // стенки
+  for(const o of ["h","v"]) for(const k of s[o]){ const R=wallRect(Math.floor(k/10),k%10,o); el("rect",{x:R.x,y:R.y,width:R.w,height:R.h,rx:2,fill:css("--wall")}); }
+  // подсказка
+  if(hintOn&&a.length){ const bm=a[0].m;
+    if(bm.k==="w"){ const R=wallRect(bm.x,bm.y,bm.o); el("rect",{x:R.x-3,y:R.y-3,width:R.w+6,height:R.h+6,rx:5,fill:css("--hint-soft")}); el("rect",{x:R.x,y:R.y,width:R.w,height:R.h,rx:2,fill:css("--hint"),opacity:.85}); }
+    else { const me=s.p[s.t], x1=cellX(me[0])+S/2, y1=cellY(me[1])+S/2, x2=cellX(bm.c)+S/2, y2=cellY(bm.r)+S/2;
+      const L=Math.hypot(x2-x1,y2-y1), ux=(x2-x1)/L, uy=(y2-y1)/L;
+      el("circle",{cx:x2,cy:y2,r:20,fill:"none",stroke:css("--hint"),"stroke-width":4});
+      el("line",{x1:x1+ux*22,y1:y1+uy*22,x2:x2-ux*26,y2:y2-uy*26,stroke:css("--hint"),"stroke-width":5,"stroke-linecap":"round",opacity:.9});
+      const hx=x2-ux*24, hy=y2-uy*24; el("polygon",{points:`${hx},${hy} ${hx-ux*12-uy*8},${hy-uy*12+ux*8} ${hx-ux*12+uy*8},${hy-uy*12-ux*8}`,fill:css("--hint")}); }
+  }
+  // фишки
+  el("circle",{cx:cellX(s.p[W][0])+S/2,cy:cellY(s.p[W][1])+S/2,r:19,fill:css("--white-pawn"),stroke:"#9aa0a6","stroke-width":2});
+  el("circle",{cx:cellX(s.p[B][0])+S/2,cy:cellY(s.p[B][1])+S/2,r:19,fill:css("--black-pawn"),stroke:"#5d636b","stroke-width":2});
+  // наведение
+  if(hover){
+    if(hover.k==="w"){ const ok=wallLegal(s,hover.x,hover.y,hover.o)&&winner(s)===null; const R=wallRect(hover.x,hover.y,hover.o);
+      el("rect",{x:R.x,y:R.y,width:R.w,height:R.h,rx:2,fill:ok?css("--wall"):css("--bad"),opacity:ok?.55:.45,"pointer-events":"none"});
+      const t=el("text",{x:R.x+R.w/2,y:R.y-6,"text-anchor":"middle","font-size":12,"font-family":"JetBrains Mono, monospace",fill:ok?css("--fg"):css("--bad"),"pointer-events":"none"}); t.textContent=fmt(hover)+(ok?"":" ✕"); }
+    else if(pm.some(([c,r])=>c===hover.c&&r===hover.r)) el("rect",{x:cellX(hover.c)+1,y:cellY(hover.r)+1,width:S-2,height:S-2,rx:3,fill:"none",stroke:css("--fg"),"stroke-width":2,opacity:.5,"pointer-events":"none"});
+  }
+}
+function pick(evt){
+  const pt=svg.createSVGPoint(); pt.x=evt.clientX; pt.y=evt.clientY; const p=pt.matrixTransform(svg.getScreenCTM().inverse());
+  let gx=(p.x-PAD+G/2)/STEP, gy=(p.y-PAD+G/2)/STEP; // экранные единицы сетки
+  if(gx<0||gx>9||gy<0||gy>9) return null;
+  gx=flipped?9-gx:gx; gy=flipped?gy:9-gy;             // → координаты доски (row вверх)
+  const thr=(G/2+5)/STEP, dv=Math.abs(gx-Math.round(gx)), dh=Math.abs(gy-Math.round(gy));
+  const clamp=v=>Math.max(0,Math.min(7,v));
+  if(dv<thr&&dv<=dh&&Math.round(gx)>0&&Math.round(gx)<9) return {k:"w",o:"v",x:Math.round(gx)-1,y:clamp(Math.round(gy-1))};
+  if(dh<thr&&Math.round(gy)>0&&Math.round(gy)<9) return {k:"w",o:"h",y:Math.round(gy)-1,x:clamp(Math.round(gx-1))};
+  return {k:"p",c:Math.min(8,Math.floor(gx)),r:Math.min(8,Math.floor(gy))};
+}
+svg.addEventListener("mousemove",e=>{ const h=pick(e); if(JSON.stringify(h)!==JSON.stringify(hover)){hover=h; drawBoard();} });
+svg.addEventListener("mouseleave",()=>{hover=null; drawBoard();});
+svg.addEventListener("click",e=>{ const h=pick(e); if(!h) return; play(h); });
+
+function play(m){
+  const s=ST[ply]; if(winner(s)!==null){toast("Партия окончена"); return;}
+  if(m.k==="p"&&!pawnMoves(s).some(([c,r])=>c===m.c&&r===m.r)) return;
+  if(m.k==="w"&&!wallLegal(s,m.x,m.y,m.o)){ toast(s.wl[s.t]<=0?"Стенки закончились":`Стенка ${fmt(m)} нелегальна`); return; }
+  if(ply<line.length){ if(same(line[ply],m)){ ply++; render(); return; }
+    if(!mainLine) mainLine=line.slice(); line=line.slice(0,ply); }
+  line.push(m); rebuild(); ply=line.length; hover=null; render();
+}
+
+// ---------- Панели ----------
+const fmtE=e=>Math.abs(e)>=90?(e>0?"Б+":"Ч+")+"∞":(e>0?"+":e<0?"−":"")+Math.abs(e).toFixed(1);
+function render(){
+  const s=ST[ply], a=anal(ply);
+  drawBoard();
+  const e=evalW(s), pct=50+50*Math.tanh(e/5);
+  document.getElementById("evalW").style.height=pct+"%";
+  const num=document.getElementById("evalNum"); num.textContent=fmtE(e);
+  if(e>=0){num.style.bottom="4px";num.style.top="";num.style.color="#111";} else {num.style.top="4px";num.style.bottom="";num.style.color="#eee";}
+  const dW=dist(s,W), dB=dist(s,B), bar=n=>"▮".repeat(n)+"<i>"+"▯".repeat(10-n)+"</i>";
+  document.getElementById("status").innerHTML=
+    `<span class="dot b"></span><span>Чёрные</span><span class="dist">до финиша ${dB}</span>`+
+    `<span></span><span class="walls">${bar(s.wl[B])}</span><span class="dist">${s.wl[B]} стен.</span>`+
+    `<span class="dot w"></span><span>Белые</span><span class="dist">до финиша ${dW}</span>`+
+    `<span></span><span class="walls">${bar(s.wl[W])}</span><span class="dist">${s.wl[W]} стен.</span>`;
+  const w=winner(s);
+  document.getElementById("turn").innerHTML= w!==null?`<b>Победили ${w===W?"белые":"чёрные"}</b>`:`Ход: <b>${s.t===W?"белые":"чёрные"}</b> · полуход ${ply} из ${line.length}`;
+  const best=document.getElementById("best");
+  if(!hintOn){ best.innerHTML=`<div class="hidden-hint">Подсказка скрыта. Нажмите <kbd>H</kbd>, когда подумаете сами.</div>`; }
+  else if(!a.length){ best.innerHTML=`<div class="hidden-hint">Ходов нет: партия окончена.</div>`; }
+  else best.innerHTML=a.slice(0,3).map((x,i)=>`<div class="bm${i?"":" top"}" data-i="${i}" tabindex="0" role="button"><span class="rk">${i+1}</span><span class="mv">${fmt(x.m)}</span><span class="why">${why(s,x)}</span><span class="ev">${fmtE(x.e)}</span></div>`).join("");
+  best.querySelectorAll(".bm").forEach(d=>{const go=()=>play(a[+d.dataset.i].m); d.onclick=go; d.onkeydown=ev=>{if(ev.key==="Enter")go();};});
+  // список ходов
+  const mv=document.getElementById("moves"); let h="";
+  for(let i=0;i<line.length;i+=2){
+    h+=`<span class="n">${i/2+1}.</span>`;
+    for(const j of [i,i+1]){ if(j>=line.length){h+="<span></span>";continue;}
+      const isVar=mainLine&&(j>=mainLine.length||!same(mainLine[j],line[j]));
+      const mk=marks[j]?`<span class="mk ${marks[j]}">${MK[marks[j]]}</span>`:"";
+      h+=`<span class="mvc${ply===j+1?" cur":""}${isVar?" var":""}" data-p="${j+1}">${fmt(line[j])}${mk}</span>`; }
+  }
+  mv.innerHTML=h||`<span class="n"></span><span class="hidden-hint">Сделайте ход на доске или загрузите партию.</span>`;
+  mv.querySelectorAll(".mvc").forEach(d=>d.onclick=()=>{ply=+d.dataset.p; render();});
+  const cur=mv.querySelector(".cur"); if(cur) cur.scrollIntoView({block:"nearest"});
+  // сводка
+  const cnt=(pl,k)=>marks.filter((x,i)=>i%2===pl&&x===k).length;
+  const acc=pl=>{ let n=0,sum=0; line.forEach((m,i)=>{ if(i%2!==pl) return; const a=anal(i); if(!a.length) return; const got=a.find(x=>same(x.m,m)); const loss=Math.max(0,a[0].me-(got?got.me:a[0].me)); sum+=Math.max(0,100-loss*25); n++; }); return n?Math.round(sum/n):"—"; };
+  document.getElementById("summary").innerHTML=line.length?
+    `<span></span><span class="h">Белые</span><span class="h">Чёрные</span>`+
+    `<span class="h">Точность</span><span>${acc(W)}%</span><span>${acc(B)}%</span>`+
+    `<span class="h mk b">Грубые ??</span><span>${cnt(0,"b")}</span><span>${cnt(1,"b")}</span>`+
+    `<span class="h mk m">Ошибки ?</span><span>${cnt(0,"m")}</span><span>${cnt(1,"m")}</span>`+
+    `<span class="h mk i">Неточности ?!</span><span>${cnt(0,"i")}</span><span>${cnt(1,"i")}</span>`:"";
+  document.getElementById("bRestore").hidden=!mainLine;
+  drawGraph();
+}
+function drawGraph(){
+  const g=document.getElementById("graph"); g.innerHTML="";
+  const Wd=600,Hd=120,P=8, n=ST.length, vals=ST.map(s=>Math.max(-8,Math.min(8,evalW(s))));
+  const xs=i=>P+(n>1?i*(Wd-2*P)/(n-1):0), ys=v=>Hd/2-v*(Hd/2-P)/8;
+  const mk=(t,a)=>{const e=document.createElementNS(NS,t); for(const k in a) e.setAttribute(k,a[k]); g.appendChild(e); return e;};
+  mk("rect",{x:0,y:0,width:Wd,height:Hd/2,fill:"#2a2e35"}); mk("rect",{x:0,y:Hd/2,width:Wd,height:Hd/2,fill:"#14161a"});
+  mk("line",{x1:0,y1:Hd/2,x2:Wd,y2:Hd/2,stroke:css("--line")});
+  mk("text",{x:Wd-6,y:14,"text-anchor":"end","font-size":10,fill:css("--muted"),"font-family":"Onest, sans-serif"}).textContent="перевес белых";
+  mk("text",{x:Wd-6,y:Hd-6,"text-anchor":"end","font-size":10,fill:css("--muted"),"font-family":"Onest, sans-serif"}).textContent="перевес чёрных";
+  if(n>1){ let d=`M${xs(0)},${Hd/2}`; vals.forEach((v,i)=>d+=` L${xs(i)},${ys(v)}`); d+=` L${xs(n-1)},${Hd/2} Z`;
+    mk("path",{d,fill:"rgba(242,242,242,.18)"});
+    mk("polyline",{points:vals.map((v,i)=>`${xs(i)},${ys(v)}`).join(" "),fill:"none",stroke:css("--fg"),"stroke-width":1.5});
+    marks.forEach((m,i)=>{ if(m==="b"||m==="m") mk("circle",{cx:xs(i+1),cy:ys(vals[i+1]),r:3.5,fill:m==="b"?css("--blunder"):css("--mistake")}); }); }
+  mk("line",{x1:xs(ply),y1:0,x2:xs(ply),y2:Hd,stroke:css("--hint"),"stroke-width":2});
+  g.onclick=e=>{ const pt=g.createSVGPoint(); pt.x=e.clientX; pt.y=e.clientY; const p=pt.matrixTransform(g.getScreenCTM().inverse());
+    ply=Math.max(0,Math.min(n-1,Math.round((p.x-P)/((Wd-2*P)/Math.max(1,n-1))))); render(); };
+}
+
+// ---------- Управление ----------
+const $=id=>document.getElementById(id);
+function toast(t){ const e=$("toast"); e.textContent=t; e.classList.add("show"); clearTimeout(toast.t); toast.t=setTimeout(()=>e.classList.remove("show"),1600); }
+$("bFirst").onclick=()=>{ply=0;render();}; $("bLast").onclick=()=>{ply=line.length;render();};
+$("bPrev").onclick=()=>{ply=Math.max(0,ply-1);render();}; $("bNext").onclick=()=>{ply=Math.min(line.length,ply+1);render();};
+$("bUndo").onclick=()=>{ if(!line.length) return; if(!mainLine) mainLine=line.slice(); line=line.slice(0,Math.max(0,ply-1)); rebuild(); ply=line.length; render(); };
+$("bFlip").onclick=()=>{flipped=!flipped; render(); toast(flipped?"Чёрные снизу":"Белые снизу");};
+$("bHint").onclick=()=>{hintOn=!hintOn; $("bHint").classList.toggle("on",hintOn); $("hintLbl").textContent=" Подсказка: "+(hintOn?"вкл":"выкл"); render();};
+$("bRestore").onclick=()=>{ line=mainLine; mainLine=null; rebuild(); ply=Math.min(ply,line.length); render(); toast("Партия восстановлена"); };
+$("bNew").onclick=()=>{ line=[]; mainLine=null; rebuild(); ply=0; render(); };
+$("bCopy").onclick=()=>{ const t=line.map(fmt).join(" "); const done=()=>toast("Ходы скопированы");
+  try{ navigator.clipboard.writeText(t).then(done,()=>{$("pgn").value=t; $("pgn").select(); toast("Ходы в поле ниже: Ctrl+C");}); }catch(_){ $("pgn").value=t; $("pgn").select(); } };
+function loadText(t,quiet){
+  const toks=t.replace(/\d+\./g," ").split(/[\s,;]+/).filter(x=>x&&x.toLowerCase()!=="start");
+  let s=initial(); const ms=[];
+  for(const [i,tok] of toks.entries()){ const m=parse(tok);
+    if(!m){ $("loadMsg").textContent=`Не понял «${tok}» (ход ${i+1})`; $("loadMsg").className="msg err"; return false; }
+    if(!isLegal(s,m)){ $("loadMsg").textContent=`Ход ${i+1} «${tok}» нелегален`; $("loadMsg").className="msg err"; return false; }
+    ms.push(m); s=apply(s,m); }
+  line=ms; mainLine=null; rebuild(); ply=line.length; render();
+  if(!quiet){ $("loadMsg").textContent=`Загружено ${ms.length} полуходов`; $("loadMsg").className="msg"; }
+  return true;
+}
+$("bCompact").onclick=()=>{document.body.classList.toggle("compact"); $("bCompact").classList.toggle("on",document.body.classList.contains("compact")); render();};
+$("bPin").onclick=()=>{$("bPin").classList.toggle("on"); toast($("bPin").classList.contains("on")?"Поверх всех окон: вкл (в приложении)":"Поверх всех окон: выкл");};
+$("bLoad").onclick=()=>loadText($("pgn").value);
+document.addEventListener("keydown",e=>{
+  if(e.target.tagName==="TEXTAREA") return;
+  const k=e.key;
+  if(k==="ArrowLeft"){$("bPrev").click();e.preventDefault();}
+  else if(k==="ArrowRight"){$("bNext").click();e.preventDefault();}
+  else if(k==="Home") $("bFirst").click(); else if(k==="End") $("bLast").click();
+  else if(k==="Backspace"){$("bUndo").click();e.preventDefault();}
+  else if(k==="f"||k==="F"||k==="а"||k==="А") $("bFlip").click();
+  else if(k==="h"||k==="H"||k==="р"||k==="Р") $("bHint").click();
+  else if(k==="c"||k==="C"||k==="с"||k==="С") $("bCompact").click();
+});
+$("pgn").value=GAME01;
+loadText(GAME01,true);
+ply=44; render();  // открываем перед 23-м ходом белых (f4, диагональный прыжок)
+</script>
