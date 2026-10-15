@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Анализатор Коридора</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Анализатор Коридора</h1>
+    <span class="tag">Подсказки бота v3, офлайн. Ходы за обе стороны вводите сами.</span>
+  </header>
+
+  <div class="main">
+    <section class="left">
+      <div class="toolbar">
+        <button id="bUndo" title="Отменить ход (Backspace)">↶<span class="lbl"> Отменить</span><kbd>⌫</kbd></button>
+        <button id="bFlip" title="Перевернуть доску (F)">⇅<span class="lbl"> Перевернуть</span><kbd>F</kbd></button>
+        <button id="bHint" class="on" title="Подсказка (H)">💡<span class="lbl" id="hintLbl"> Подсказка: вкл</span><kbd>H</kbd></button>
+      </div>
+      <div class="boardrow">
+        <div class="evalbar" id="evalbar" aria-label="Шкала оценки"><div class="w" id="evalW"></div><div class="num" id="evalNum"></div></div>
+        <div class="boardbox"><svg id="board" viewBox="0 0 600 600" role="img" aria-label="Доска 9 на 9"></svg></div>
+      </div>
+      <div class="legend">
+        <span>Клик по клетке: ход фишкой.</span>
+        <span>Наведите на щель между клетками: появится стенка, клик ставит её.</span>
+        <span>Ход за обе стороны.</span>
+      </div>
+    </section>
+
+    <aside class="side">
+      <div class="card">
+        <div class="status" id="status"></div>
+        <div class="turn" id="turn"></div>
+      </div>
+      <div class="card">
+        <h2>Лучшие ходы</h2>
+        <div class="best" id="best"></div>
+        <div class="msg" id="anaMsg"></div>
+      </div>
+      <div class="card">
+        <h2>Партия</h2>
+        <div class="moves" id="moves"></div>
+        <div class="toolbar"><button id="bCopy">Копировать ходы</button><button id="bNew">Новая доска</button></div>
+      </div>
+    </aside>
+  </div>
+</div>
+<div class="toast" id="toast" role="status"></div>
+<script src="/app.js"></script>
+</body>
+</html>
