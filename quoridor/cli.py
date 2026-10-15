@@ -127,7 +127,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="python -m quoridor.cli", description="Коридор: человек против бота"
     )
-    p.add_argument("--bot", choices=sorted(BOTS), default="greedy")
+    p.add_argument("--bot", choices=sorted(BOTS), default="v3")
     p.add_argument("--color", choices=("white", "black"), default="white")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument(

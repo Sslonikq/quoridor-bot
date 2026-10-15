@@ -216,6 +216,6 @@ def test_two_scripted_players_full_game_to_win():
 
 def test_parser_defaults():
     a = build_parser().parse_args([])
-    assert (a.bot, a.color, a.seed, a.max_moves) == ("greedy", "white", 0, 300)
+    assert (a.bot, a.color, a.seed, a.max_moves) == ("v3", "white", 0, 300)
     a = build_parser().parse_args(["--bot", "random", "--color", "black", "--seed", "3"])
     assert (a.bot, a.color, a.seed) == ("random", "black", 3)
