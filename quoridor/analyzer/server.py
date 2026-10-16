@@ -1,7 +1,18 @@
 """Local JSON API + static files. Binds 127.0.0.1 only, a random free port by default.
 
   POST /api/state    {"moves": [...]}              -> position, legal moves, winner
-  POST /api/analyze  {"moves": [...], "time": 2.0} -> top-3 moves of v3, evaluation
+  POST /api/analyze  {"moves": [...], "time": 3.0} -> top-3 moves of v4, evaluation, depth
+                     ("time" is optional: engine.DEFAULT_TIME)
+  POST /api/evaluate {"moves": [...], "move": "e3h", "time": 3.0}
+                     -> score of that one move in the position after "moves" (engine.evaluate_move)
+  POST /api/cancel   {}                            -> cancels the running analysis / evaluation
+  POST /api/parse    {"text": "d1 e8 ..."}         -> {"moves": [...]}: a pasted game (see
+                     engine.parse_game_text), replayed and validated
+  POST /api/review   {"moves": [...], "time": 1.0} -> {"id", "total"}: starts a background
+                     review of the whole game (a newer one cancels the older one)
+  POST /api/review/status {"id", "since": 0}       -> {"done", "total", "finished",
+                     "cancelled", "error", "results": [steps since index `since`], "summary"}
+  POST /api/review/cancel {}                       -> cancels the running review
 
 Errors: HTTP 400 {"ok": false, "error": "...", "bad_move": N} (N = 1-based number of the
 illegal move, if the error is about one). A newer /api/analyze cancels the older one: the
@@ -20,12 +31,78 @@ from quoridor.analyzer import engine
 HOST = "127.0.0.1"
 STATIC = Path(__file__).parent / "static"
 MAX_BODY = 64 * 1024
+REVIEW_MAX_TIME = 10.0  # per position; the review has its own, smaller limit than a hint
+_TIME_ERROR = f"time must be a number from 0 to {engine.MAX_TIME:g}"
+
+
+def _valid_time(seconds: object) -> bool:
+    """A finite non-bool number in (0, engine.MAX_TIME]; small values are raised to MIN_TIME."""
+    if isinstance(seconds, bool) or not isinstance(seconds, int | float):
+        return False
+    return 0 < seconds <= engine.MAX_TIME  # False for NaN; inf > MAX_TIME
+
+
+ROUTES = (
+    "/api/state",
+    "/api/analyze",
+    "/api/evaluate",
+    "/api/cancel",
+    "/api/parse",
+    "/api/review",
+    "/api/review/status",
+    "/api/review/cancel",
+)
 _FILES = {
     "/": ("index.html", "text/html; charset=utf-8"),
     "/index.html": ("index.html", "text/html; charset=utf-8"),
     "/app.js": ("app.js", "text/javascript; charset=utf-8"),
     "/app.css": ("app.css", "text/css; charset=utf-8"),
 }
+
+
+class ReviewJob:
+    """A game review running in its own thread; the client polls it."""
+
+    def __init__(self, job_id: int, moves: list[str], seconds: float) -> None:
+        self.id = job_id
+        self.moves = moves
+        self.total = len(moves) + 1  # positions 0..len(moves)
+        self.cancel = threading.Event()
+        self.lock = threading.Lock()
+        self.steps: list[dict] = []
+        self.finished = False
+        self.error: str | None = None
+        self.thread = threading.Thread(target=self._run, args=(seconds,), daemon=True)
+
+    def _run(self, seconds: float) -> None:
+        try:
+            for step in engine.review_game(self.moves, seconds, self.cancel.is_set):
+                with self.lock:
+                    self.steps.append(step)
+        except Exception as e:  # noqa: BLE001 - reported to the client, never kills the server
+            with self.lock:
+                self.error = f"{type(e).__name__}: {e}"
+        finally:
+            with self.lock:
+                self.finished = True
+
+    def status(self, since: int) -> dict:
+        with self.lock:
+            steps = list(self.steps)
+            finished = self.finished
+            error = self.error
+        cancelled = self.cancel.is_set() and len(steps) < self.total
+        return {
+            "ok": True,
+            "id": self.id,
+            "total": self.total,
+            "done": len(steps),
+            "finished": finished,
+            "cancelled": cancelled,
+            "error": error,
+            "results": steps[since:],
+            "summary": engine.summarize(steps),
+        }
 
 
 class AnalyzerServer(ThreadingHTTPServer):
@@ -35,6 +112,8 @@ class AnalyzerServer(ThreadingHTTPServer):
         super().__init__((HOST, port), Handler)
         self._job_lock = threading.Lock()
         self._job: threading.Event | None = None
+        self._review: ReviewJob | None = None
+        self._review_seq = 0
 
     @property
     def url(self) -> str:
@@ -48,6 +127,40 @@ class AnalyzerServer(ThreadingHTTPServer):
                 self._job.set()
             self._job = ev
         return ev
+
+    def start_review(self, moves: list[str], seconds: float) -> ReviewJob:
+        """Start a review; the previous review and the running analysis are cancelled."""
+        self.cancel_job()
+        with self._job_lock:
+            if self._review is not None:
+                self._review.cancel.set()
+            self._review_seq += 1
+            job = self._review = ReviewJob(self._review_seq, moves, seconds)
+        job.thread.start()
+        return job
+
+    def get_review(self, job_id: object) -> ReviewJob | None:
+        with self._job_lock:
+            r = self._review
+        if isinstance(job_id, bool) or not isinstance(job_id, int):
+            return None
+        return r if r is not None and r.id == job_id else None
+
+    def cancel_review(self) -> None:
+        with self._job_lock:
+            if self._review is not None:
+                self._review.cancel.set()
+
+    def server_close(self) -> None:
+        self.cancel_review()
+        super().server_close()
+
+    def cancel_job(self) -> None:
+        """Cancel the running analysis (if any); its request answers "cancelled"."""
+        with self._job_lock:
+            if self._job is not None:
+                self._job.set()
+                self._job = None
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -134,7 +247,7 @@ class Handler(BaseHTTPRequestHandler):
             self._drain()
             return self._error(403, "bad host")
         route = self.path.split("?", 1)[0]
-        if route not in ("/api/state", "/api/analyze"):
+        if route not in ROUTES:
             self.close_connection = True
             self._drain()
             return self._error(404, "not found")
@@ -154,15 +267,49 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError
         except (ValueError, RecursionError):  # deeply nested JSON raises RecursionError
             return self._error(400, "body must be a JSON object")
+        if route == "/api/cancel":
+            self.server.cancel_job()
+            return self._json(200, {"ok": True})
+        if route == "/api/review/cancel":
+            self.server.cancel_review()
+            return self._json(200, {"ok": True})
         moves = body.get("moves", [])
         try:
+            if route == "/api/parse":
+                text_moves = engine.parse_game_text(body.get("text"))
+                return self._json(200, {"ok": True, "moves": text_moves})
+            if route == "/api/review/status":
+                since = body.get("since", 0)
+                if isinstance(since, bool) or not isinstance(since, int) or since < 0:
+                    return self._error(400, "since must be a non-negative integer")
+                job = self.server.get_review(body.get("id"))
+                if job is None:
+                    return self._error(404, "unknown review")
+                return self._json(200, job.status(since))
+            if route == "/api/review":
+                seconds = body.get("time", engine.REVIEW_TIME)
+                if not _valid_time(seconds):
+                    return self._error(400, _TIME_ERROR)
+                engine.replay(moves)
+                if not moves:
+                    return self._error(400, "nothing to review")
+                job = self.server.start_review(moves, min(float(seconds), REVIEW_MAX_TIME))
+                return self._json(200, {"ok": True, "id": job.id, "total": job.total})
             if route == "/api/state":
                 pos = engine.describe(engine.replay(moves), moves)
                 return self._json(200, {"ok": True, "position": pos})
             seconds = body.get("time", engine.DEFAULT_TIME)
-            if isinstance(seconds, bool) or not isinstance(seconds, int | float):
-                return self._error(400, "time must be a number")
+            if not _valid_time(seconds):
+                return self._error(400, _TIME_ERROR)
             engine.replay(moves)  # reject bad input before cancelling the running job
+            if route == "/api/evaluate":
+                move = body.get("move")
+                if not isinstance(move, str):
+                    raise engine.MoveListError("move must be a string", len(moves) + 1)
+                engine.replay([*moves, move])  # the move must be legal after `moves`
+                cancel = self.server.start_job()
+                res = engine.evaluate_move(moves, move, float(seconds), cancel.is_set)
+                return self._json(200, {"ok": True, **res})
             cancel = self.server.start_job()
             res = engine.analyze(moves, float(seconds), cancel.is_set)
             if res["cancelled"]:

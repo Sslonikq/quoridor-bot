@@ -6,23 +6,26 @@ replayed here from the initial position with rules.apply_move (illegal moves are
 
 from __future__ import annotations
 
+import re
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 
-from quoridor.bots import V3_WALL_WEIGHT
+from quoridor.bots import V4_SETTINGS
 from quoridor.eval import WIN
 from quoridor.notation import format_move, parse_move
 from quoridor.paths import shortest_path_length
 from quoridor.rules import apply_move, apply_move_unchecked, legal_moves, pawn_moves, winner
-from quoridor.search import V2_TT_BITS, Searcher, is_win_score
+from quoridor.search import Searcher, display_score, is_win_score
 from quoridor.state import GameState, Move, PawnMove, goal_row
 
 MAX_MOVES = 400  # more than any real game (arena limit is 300 plies)
-DEFAULT_TIME = 2.0
+DEFAULT_TIME = 5.0  # seconds per hint (the UI may send its own "time")
+DEEP_TIME = 20.0  # "Глубокий анализ" button (UI sends it explicitly)
 MIN_TIME = 0.1
-MAX_TIME = 10.0
+MAX_TIME = 30.0  # upper bound of an explicit "time"; the server rejects more
 TOP_N = 3
+ALT_SHARE = 0.1  # min. extra share for the top-2/3; the best move's search gets the whole budget
 
 
 class MoveListError(ValueError):
@@ -112,10 +115,10 @@ class _Cancelled(Exception):
 
 
 class _CancellableSearcher(Searcher):
-    """v3 searcher that aborts as soon as `cancelled()` turns true (checked at every leaf)."""
+    """v4 searcher that aborts as soon as `cancelled()` turns true (checked at every leaf)."""
 
     def __init__(self, cancelled: Callable[[], bool]) -> None:
-        super().__init__(0, tt_bits=V2_TT_BITS, wall_weight=V3_WALL_WEIGHT)
+        super().__init__(0, **V4_SETTINGS)
         self._cancelled = cancelled
 
     def evaluate(self, state: GameState) -> int:
@@ -127,7 +130,9 @@ class _CancellableSearcher(Searcher):
 @dataclass(frozen=True)
 class RankedMove:
     move: Move
-    score: int  # centi-steps for the side to move (WIN-ish for proven results)
+    score: int  # display centi-steps for the side to move (WIN-ish for proven results)
+    depth: int = 1  # plies from the root at which the score was found
+    exact: bool = True  # False: an upper bound (an alternative that was only refuted)
 
 
 def _score_white(state: GameState, score: int) -> int:
@@ -139,61 +144,128 @@ def rank_moves(
     budget: float,
     cancelled: Callable[[], bool] = lambda: False,
 ) -> tuple[list[RankedMove], int]:
-    """Rank root moves by v3 search. Returns (moves best first, depth from the root).
+    """Top moves of v4. Returns (moves best first, depth of the best move from the root).
 
-    The depth is counted from the position `state` itself: iteration k searches each
-    child to k plies, so the root move plus that is k + 1 plies (a win on the spot: 1).
-
-    Each iteration k searches every root move (pruned wall set + pawn moves) to depth k
-    with a full window, so the scores are comparable; an iteration that does not finish
-    inside the budget is dropped. Iteration 1 always completes. Raises ValueError on a
-    terminal position.
+    The best move comes from ONE ordinary search (Searcher.search_top: the same search
+    as SearchBot.choose_move with move_time = budget, TT, iterative deepening, so the same
+    depth); the other TOP_N - 1 moves from a cheap search_root of the remaining root moves
+    in what is left of the budget (at least ALT_SHARE of it), reusing the TT. The depth
+    is counted from `state` (the root move is ply 1; a win on the spot: 1). Scores are
+    display scores (search.display_score: no odd/even depth swing); alternatives are
+    never shown above the best move. Raises ValueError on a terminal position; returns
+    ([], 0) when cancelled.
     """
     if winner(state) is not None:
         raise ValueError("terminal position")
-    t0 = time.perf_counter()
     goal = goal_row(state.turn)
     wins = [m for m in pawn_moves(state) if m.row == goal]
     if wins:
         return [RankedMove(m, WIN - 1) for m in wins[:TOP_N]], 1
     searcher = _CancellableSearcher(cancelled)
-    root = searcher.ordered_moves(state)
-    if not root:
-        root = [(m, apply_move_unchecked(state, m)) for m in legal_moves(state)]
-    ranked: list[RankedMove] = []
-    done = 0
-    depth = 1
-    while True:
-        scores: list[RankedMove] = []
-        complete = True
-        for mv, child in root:
-            if cancelled():
-                return ranked, done
-            if winner(child) is not None:  # unreachable: wins handled above
-                scores.append(RankedMove(mv, WIN - 1))
-                continue
-            left = budget - (time.perf_counter() - t0)
-            if depth > 1 and left <= 0:
-                complete = False
-                break
-            try:
-                res = searcher.search(child, depth, max(left, 0.01) if depth > 1 else None)
-            except _Cancelled:
-                return ranked, done
-            if depth > 1 and res.depth < depth and not is_win_score(res.score):
-                complete = False
-                break
-            scores.append(RankedMove(mv, -res.score))
-        if not complete or cancelled():
-            break
-        scores.sort(key=lambda r: -r.score)
-        ranked, done = scores, depth + 1
-        if is_win_score(ranked[0].score) or len(root) == 1:
-            break
-        if time.perf_counter() - t0 > budget / 2 or depth >= 40:
-            break  # the next iteration would most likely not finish
-        depth += 1
-    return ranked, done
+    try:
+        res = searcher.search_top(state, budget, TOP_N, ALT_SHARE)
+    except _Cancelled:
+        return [], 0
+    best = res.best
+    ranked = [RankedMove(best.move, best.display_score, best.depth, True)]
+    ranked += [RankedMove(a.move, a.score, a.depth, a.exact) for a in res.alts]
+    return ranked, best.depth
+
+
+def _clamp_time(seconds: float) -> float:
+    return min(MAX_TIME, max(MIN_TIME, seconds))
+
+
+def evaluate_move(
+    moves: object,
+    move: object,
+    seconds: float = DEFAULT_TIME,
+    cancelled: Callable[[], bool] = lambda: False,
+) -> dict:
+    """Score of one given move in the position after `moves` (e.g. the move actually
+    played, which may be outside the analyzer's top: the root wall set is pruned by
+    wall_limit). One v4 search_root over just that move, the whole budget.
+
+    Returns move_json + score (display centi-steps, white's view), mate, depth (from the
+    position, the move itself is ply 1), why, elapsed, cancelled. MoveListError if the
+    game is over or `move` is not a legal move (number = its index after `moves`).
+    """
+    state = replay(moves)
+    assert isinstance(moves, list)
+    number = len(moves) + 1
+    if winner(state) is not None:
+        raise MoveListError("the game is over", number)
+    if not isinstance(move, str):
+        raise MoveListError(f"move {number}: not a string", number)
+    try:
+        mv = parse_move(move)
+        apply_move(state, mv)
+    except ValueError:
+        raise MoveListError(f"move {number}: {move!r} is illegal", number) from None
+    t0 = time.perf_counter()
+    scored = _score_move(state, mv, seconds, cancelled)
+    if scored is None:
+        return {**move_json(mv), "cancelled": True}
+    score, depth = scored
+    return {
+        **move_json(mv),
+        "score": _score_white(state, score),
+        "mate": is_win_score(score),
+        "depth": depth,
+        "why": _why(state, mv, apply_move_unchecked(state, mv), score),
+        "elapsed": round(time.perf_counter() - t0, 3),
+        "cancelled": False,
+    }
+
+
+def _score_move(
+    state: GameState, mv: Move, seconds: float, cancelled: Callable[[], bool]
+) -> tuple[int, int] | None:
+    """(display score for the side to move, depth) of one legal move; None if cancelled."""
+    searcher = _CancellableSearcher(cancelled)
+    try:
+        rs = searcher.search_root(state, time_limit=_clamp_time(seconds), moves=[mv])
+    except _Cancelled:
+        return None
+    r = rs.scores[0]
+    return display_score(r.score, r.depth), r.depth
+
+
+def _same_depth_scores(
+    state: GameState,
+    best: Move,
+    played: Move,
+    seconds: float,
+    cancelled: Callable[[], bool],
+) -> tuple[int, int, int] | None:
+    """(best score, played score, depth) of two moves from ONE search_root: both at the
+    same completed depth, as deep as `seconds` allows (it stops early once both are
+    proven), so a slower mate of the played move can still be found. Display scores for
+    the side to move; None if cancelled."""
+    searcher = _CancellableSearcher(cancelled)
+    try:
+        rs = searcher.search_root(state, time_limit=_clamp_time(seconds), moves=[best, played])
+    except _Cancelled:
+        return None
+    sc = {r.move: display_score(r.score, r.depth) for r in rs.scores}
+    return sc[best], sc[played], rs.depth
+
+
+def _top_entries(state: GameState, ranked: list[RankedMove]) -> list[dict]:
+    top = []
+    for r in ranked[:TOP_N]:
+        child = apply_move_unchecked(state, r.move)
+        top.append(
+            {
+                **move_json(r.move),
+                "mate": is_win_score(r.score),
+                "score": _score_white(state, r.score),  # centi-steps, white's view
+                "why": _why(state, r.move, child, r.score),
+                "depth": r.depth,  # plies from the position for this score
+                "exact": r.exact,  # False: an upper bound ("not better than")
+            }
+        )
+    return top
 
 
 def analyze(
@@ -203,9 +275,11 @@ def analyze(
 ) -> dict:
     """Top-3 moves with scores and reasons, plus the position evaluation (white's view).
 
-    Each top entry is move_json + score (centi-steps, white's view), mate (proven win/loss,
-    set by the server so that the client knows no score constants) and why. `depth` is
-    counted from the analysed position (see rank_moves).
+    Each top entry is move_json + score (display centi-steps, white's view), mate (proven
+    win/loss, set by the server so that the client knows no score constants), why, depth
+    (plies of that entry's search) and exact (False: an upper bound). The top-level
+    `depth` is the depth of the best move's search, counted from the analysed position
+    (see rank_moves).
     """
     state = replay(moves)
     pos = describe(state, moves)
@@ -218,7 +292,7 @@ def analyze(
             "depth": 0,
             "cancelled": False,
         }
-    seconds = min(MAX_TIME, max(MIN_TIME, seconds))
+    seconds = _clamp_time(seconds)
     t0 = time.perf_counter()
     ranked, depth = rank_moves(state, seconds, cancelled)
     if cancelled() or not ranked:
@@ -230,17 +304,7 @@ def analyze(
             "depth": 0,
             "cancelled": True,
         }
-    top = []
-    for r in ranked[:TOP_N]:
-        child = apply_move_unchecked(state, r.move)
-        top.append(
-            {
-                **move_json(r.move),
-                "mate": is_win_score(r.score),
-                "score": _score_white(state, r.score),  # centi-steps, white's view
-                "why": _why(state, r.move, child, r.score),
-            }
-        )
+    top = _top_entries(state, ranked)
     return {
         "position": pos,
         "top": top,
@@ -250,3 +314,189 @@ def analyze(
         "elapsed": round(time.perf_counter() - t0, 3),
         "cancelled": False,
     }
+
+
+# ---------------------------------------------------------------------------------------
+# Game text and game review
+# ---------------------------------------------------------------------------------------
+
+_MOVE_NO = re.compile(r"^\d+\.+")
+
+
+def parse_game_text(text: object) -> list[str]:
+    """Moves (site notation, normalised) from pasted text.
+
+    Moves are separated by spaces / line breaks / commas / semicolons ("d1 e8 c1 ..." and
+    the fixtures' "<white> <black>" lines are the same thing). Everything after "#" is a
+    comment; a leading move number ("12.") is dropped. The whole list is replayed from the
+    initial position: MoveListError (number = 1-based move) on junk or an illegal move.
+    """
+    if not isinstance(text, str):
+        raise MoveListError("text must be a string")
+    tokens: list[str] = []
+    for line in text.splitlines():
+        for tok in re.split(r"[\s,;]+", line.split("#", 1)[0]):
+            tok = _MOVE_NO.sub("", tok)  # parse_move normalises the case
+            if tok:
+                tokens.append(tok)
+    if len(tokens) > MAX_MOVES:
+        raise MoveListError(f"too many moves (max {MAX_MOVES})")
+    moves = []
+    for i, tok in enumerate(tokens, 1):
+        try:
+            moves.append(format_move(parse_move(tok)))
+        except ValueError:
+            raise MoveListError(f"move {i}: cannot parse {tok!r}", i) from None
+    if not moves:
+        raise MoveListError("no moves found")
+    replay(moves)
+    return moves
+
+
+# Review marks. Loss = (best score - score of the played move) for the side that moved,
+# in centi-steps; a score is clamped to +-REVIEW_CAP (10 steps) and a proven win / loss
+# counts as +-REVIEW_MATE (12 steps), so that missing a forced win or walking into a forced
+# loss is a blunder even from an already lopsided position. Never below 0.
+REVIEW_TIME = 1.0  # seconds per position (the UI may send its own "time")
+REVIEW_CAP = 1000
+REVIEW_MATE = 1200
+MARK_BLUNDER = 300  # loss >= 3.0 steps: "??"
+MARK_MISTAKE = 150  # >= 1.5: "?"
+MARK_INACCURACY = 75  # >= 0.75: "?!"
+MARK_ONLY_GAP = 150  # played the best move and the 2nd one is >= 1.5 worse: "!"
+PLAYED_SHARE = 0.4  # budget share for a separate search of a played move outside the top
+
+
+def _cap(score: int) -> int:
+    if is_win_score(score):
+        return REVIEW_MATE if score > 0 else -REVIEW_MATE
+    return max(-REVIEW_CAP, min(REVIEW_CAP, score))
+
+
+def mark_for(loss: int, played_is_best: bool, gap: int | None) -> str | None:
+    """ "b" (??), "m" (?), "i" (?!), "g" (!) or None, from the loss and the best-vs-2nd gap."""
+    if loss >= MARK_BLUNDER:
+        return "b"
+    if loss >= MARK_MISTAKE:
+        return "m"
+    if loss >= MARK_INACCURACY:
+        return "i"
+    if played_is_best and gap is not None and gap >= MARK_ONLY_GAP:
+        return "g"
+    return None
+
+
+def move_accuracy(loss: int) -> float:
+    """100 for the best move, minus 25 per step lost (loss is in centi-steps), at least 0."""
+    return max(0.0, 100.0 - loss / 4)
+
+
+def _review_position(
+    state: GameState,
+    played: Move | None,
+    seconds: float,
+    cancelled: Callable[[], bool],
+) -> dict | None:
+    """One review step: the best moves of `state` and (if given) the played move's loss."""
+    if winner(state) is not None:
+        sign = 1 if winner(state) == 0 else -1
+        return {"eval": sign * (WIN - 1), "eval_mate": True, "depth": 0, "top": [], "elapsed": 0.0}
+    t0 = time.perf_counter()
+    rank_time = seconds if played is None else seconds * (1 - PLAYED_SHARE)
+    ranked, depth = rank_moves(state, rank_time, cancelled)
+    if cancelled() or not ranked:
+        return None
+    top = _top_entries(state, ranked)
+    step: dict = {
+        "eval": top[0]["score"],
+        "eval_mate": top[0]["mate"],
+        "depth": depth,
+        "top": top,
+    }
+    if played is not None:
+        best = ranked[0]
+        hit = next((r for r in ranked if r.move == played), None)
+        if hit is not None and hit.exact:
+            p_score, p_depth, in_top = hit.score, hit.depth, True
+        else:
+            scored = _score_move(state, played, seconds * PLAYED_SHARE, cancelled)
+            if scored is None or cancelled():
+                return None
+            (p_score, p_depth), in_top = scored, hit is not None
+        best_score = best.score
+        if (
+            played != best.move
+            and is_win_score(best_score)
+            and best_score > 0
+            and not is_win_score(p_score)
+        ):
+            # A mate of the best move vs a non-mate of the played one from another search
+            # (shallower, or a slower mate beyond its horizon) is no loss measure (review
+            # 0057, minor 4): both again in one search, at one common depth, as deep as
+            # one more `seconds` allows. Only when this mismatch occurs.
+            same = _same_depth_scores(state, best.move, played, seconds, cancelled)
+            if same is None or cancelled():
+                return None
+            best_score, p_score, p_depth = same
+        loss = 0 if played == best.move else max(0, _cap(best_score) - _cap(p_score))
+        gap = _cap(best.score) - _cap(ranked[1].score) if len(ranked) > 1 else None
+        step.update(
+            {
+                "played": {
+                    "score": _score_white(state, p_score),
+                    "mate": is_win_score(p_score),
+                    "depth": p_depth,
+                    "in_top": in_top,
+                },
+                "loss": loss,
+                "mark": mark_for(loss, played == best.move, gap),
+                "accuracy": round(move_accuracy(loss), 1),
+            }
+        )
+    step["elapsed"] = round(time.perf_counter() - t0, 3)
+    return step
+
+
+def review_game(
+    moves: object,
+    seconds: float = REVIEW_TIME,
+    cancelled: Callable[[], bool] = lambda: False,
+) -> Iterator[dict]:
+    """Review of the whole game: yields one step per position 0..len(moves), in order.
+
+    Step i is the position before move i (the last one is the final position: no move).
+    Fields: index, move (name or None), eval / eval_mate (white's view, of the position),
+    depth, top (like /api/analyze), elapsed and, for a played move: played {score, mate,
+    depth, in_top}, loss (centi-steps, side to move, >= 0), mark, accuracy (0..100).
+    Stops silently when cancelled. MoveListError (before the first step) for bad moves.
+    """
+    replay(moves)
+    assert isinstance(moves, list)
+    parsed = [parse_move(m) for m in moves]
+    seconds = _clamp_time(seconds)
+    state = GameState.initial()
+    for i in range(len(moves) + 1):
+        if cancelled():
+            return
+        played = parsed[i] if i < len(moves) else None
+        step = _review_position(state, played, seconds, cancelled)
+        if step is None:
+            return
+        yield {"index": i, "move": format_move(played) if played else None, **step}
+        if played is not None:
+            state = apply_move_unchecked(state, played)
+
+
+def summarize(steps: list[dict]) -> dict:
+    """Per side: moves, accuracy (mean of per-move accuracies, None without moves), and the
+    number of "b" / "m" / "i" / "g" marks. White moves have even step indexes."""
+    out = {}
+    for side, name in ((0, "white"), (1, "black")):
+        mine = [s for s in steps if s.get("move") and s["index"] % 2 == side]
+        accs = [s["accuracy"] for s in mine]
+        out[name] = {
+            "moves": len(mine),
+            "accuracy": round(sum(accs) / len(accs), 1) if accs else None,
+            **{k: sum(1 for s in mine if s["mark"] == k) for k in "bmig"},
+        }
+    return out

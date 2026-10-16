@@ -1,7 +1,5 @@
 <title>Анализатор Коридора</title>
 <meta name="claude:viewport-fit-sides" content="cover">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Onest:wght@400;500;700&family=JetBrains+Mono:wght@400;600&display=swap">
 <style>
 /* Layout: слева шкала оценки + доска + график, справа панель (лучшие ходы, партия, загрузка). Один тёмный вид, как у игрового сайта. */
 :root{
@@ -11,8 +9,8 @@
   --wall:#e9a42f; --hint:#2ecc71; --hint-soft:rgba(46,204,113,.22); --bad:#e5534b;
   --white-pawn:#f2f2f2; --black-pawn:#0b0b0b;
   --blunder:#e5534b; --mistake:#f08c3a; --inacc:#e6c547; --best:#2ecc71;
-  --f-ui:"Onest",system-ui,-apple-system,"Segoe UI",sans-serif;
-  --f-mono:"JetBrains Mono",ui-monospace,Consolas,monospace;
+  --f-ui:system-ui,-apple-system,"Segoe UI",sans-serif;
+  --f-mono:ui-monospace,Consolas,monospace;
   color-scheme:dark;
 }
 html,body{background:var(--bg);color:var(--fg)}
@@ -72,6 +70,9 @@ kbd{font:500 11px var(--f-mono);color:var(--muted);border:1px solid var(--line);
 textarea{width:100%;box-sizing:border-box;min-height:70px;resize:vertical;background:var(--gap);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:8px;font:13px var(--f-mono)}
 .msg{font-size:12px;color:var(--muted);min-height:16px}
 .msg.err{color:var(--bad)}
+progress{width:100%;height:6px;accent-color:var(--hint)}
+progress[hidden]{display:none}
+button.busy{border-color:var(--hint);color:var(--hint)}
 .legend{font-size:12px;color:var(--muted);display:flex;flex-wrap:wrap;gap:4px 14px}
 .toast{position:fixed;left:50%;bottom:calc(20px + env(safe-area-inset-bottom,0px));transform:translateX(-50%);background:var(--panel-2);border:1px solid var(--line);padding:8px 14px;border-radius:8px;font-size:13px;opacity:0;transition:opacity .2s;pointer-events:none}
 .toast.show{opacity:1}
@@ -115,6 +116,7 @@ body.compact .side{gap:10px}
         <button id="bUndo" title="Отменить ход (Backspace)">↶<span class="lbl"> Отменить</span></button>
         <button id="bFlip" title="Перевернуть доску (F)">⇅<span class="lbl"> Перевернуть</span></button>
         <button id="bHint" class="on" title="Подсказка (H)">💡<span class="lbl" id="hintLbl"> Подсказка: вкл</span></button>
+        <button id="bDeep" title="Глубокий анализ текущей позиции, 20 с (Esc отменяет)">🔍<span class="lbl" id="deepLbl"> Глубокий анализ</span><kbd>20 с</kbd></button>
         <button id="bCompact" title="Компактный режим (C)">▭<span class="lbl"> Компактно</span></button>
         <button id="bPin" title="Поверх всех окон (в приложении)">📌</button>
       </div>
@@ -141,6 +143,8 @@ body.compact .side{gap:10px}
       <div class="card">
         <h2>Лучшие ходы</h2>
         <div class="best" id="best"></div>
+        <progress id="deepProg" value="0" max="20" hidden></progress>
+        <div class="msg" id="anaMsg"></div>
       </div>
       <div class="card moves-card">
         <h2>Партия</h2>
@@ -280,8 +284,8 @@ function drawBoard(){
   for(let c=0;c<N;c++) for(let r=0;r<N;r++)
     el("rect",{x:cellX(c),y:cellY(r),width:S,height:S,rx:3,fill:(c+r)%2?css("--cell"):css("--cell-alt")});
   // подписи
-  for(let c=0;c<N;c++) el("text",{x:cellX(c)+S-5,y:cellY(flipped?8:0)+S-5,"text-anchor":"end","font-size":11,"font-family":"JetBrains Mono, monospace",fill:css("--faint")}).textContent=COLS[c];
-  for(let r=0;r<N;r++) el("text",{x:cellX(flipped?8:0)+5,y:cellY(r)+14,"font-size":11,"font-family":"JetBrains Mono, monospace",fill:css("--faint")}).textContent=r+1;
+  for(let c=0;c<N;c++) el("text",{x:cellX(c)+S-5,y:cellY(flipped?8:0)+S-5,"text-anchor":"end","font-size":11,"font-family":"ui-monospace, Consolas, monospace",fill:css("--faint")}).textContent=COLS[c];
+  for(let r=0;r<N;r++) el("text",{x:cellX(flipped?8:0)+5,y:cellY(r)+14,"font-size":11,"font-family":"ui-monospace, Consolas, monospace",fill:css("--faint")}).textContent=r+1;
   // последний ход
   if(ply>0){ const m=line[ply-1]; if(m.k==="p") el("rect",{x:cellX(m.c)+1,y:cellY(m.r)+1,width:S-2,height:S-2,rx:3,fill:"none",stroke:"#4a5562","stroke-width":2}); }
   // легальные шаги фишкой
@@ -305,7 +309,7 @@ function drawBoard(){
   if(hover){
     if(hover.k==="w"){ const ok=wallLegal(s,hover.x,hover.y,hover.o)&&winner(s)===null; const R=wallRect(hover.x,hover.y,hover.o);
       el("rect",{x:R.x,y:R.y,width:R.w,height:R.h,rx:2,fill:ok?css("--wall"):css("--bad"),opacity:ok?.55:.45,"pointer-events":"none"});
-      const t=el("text",{x:R.x+R.w/2,y:R.y-6,"text-anchor":"middle","font-size":12,"font-family":"JetBrains Mono, monospace",fill:ok?css("--fg"):css("--bad"),"pointer-events":"none"}); t.textContent=fmt(hover)+(ok?"":" ✕"); }
+      const t=el("text",{x:R.x+R.w/2,y:R.y-6,"text-anchor":"middle","font-size":12,"font-family":"ui-monospace, Consolas, monospace",fill:ok?css("--fg"):css("--bad"),"pointer-events":"none"}); t.textContent=fmt(hover)+(ok?"":" ✕"); }
     else if(pm.some(([c,r])=>c===hover.c&&r===hover.r)) el("rect",{x:cellX(hover.c)+1,y:cellY(hover.r)+1,width:S-2,height:S-2,rx:3,fill:"none",stroke:css("--fg"),"stroke-width":2,opacity:.5,"pointer-events":"none"});
   }
 }
@@ -386,8 +390,8 @@ function drawGraph(){
   const mk=(t,a)=>{const e=document.createElementNS(NS,t); for(const k in a) e.setAttribute(k,a[k]); g.appendChild(e); return e;};
   mk("rect",{x:0,y:0,width:Wd,height:Hd/2,fill:"#2a2e35"}); mk("rect",{x:0,y:Hd/2,width:Wd,height:Hd/2,fill:"#14161a"});
   mk("line",{x1:0,y1:Hd/2,x2:Wd,y2:Hd/2,stroke:css("--line")});
-  mk("text",{x:Wd-6,y:14,"text-anchor":"end","font-size":10,fill:css("--muted"),"font-family":"Onest, sans-serif"}).textContent="перевес белых";
-  mk("text",{x:Wd-6,y:Hd-6,"text-anchor":"end","font-size":10,fill:css("--muted"),"font-family":"Onest, sans-serif"}).textContent="перевес чёрных";
+  mk("text",{x:Wd-6,y:14,"text-anchor":"end","font-size":10,fill:css("--muted"),"font-family":"system-ui, sans-serif"}).textContent="перевес белых";
+  mk("text",{x:Wd-6,y:Hd-6,"text-anchor":"end","font-size":10,fill:css("--muted"),"font-family":"system-ui, sans-serif"}).textContent="перевес чёрных";
   if(n>1){ let d=`M${xs(0)},${Hd/2}`; vals.forEach((v,i)=>d+=` L${xs(i)},${ys(v)}`); d+=` L${xs(n-1)},${Hd/2} Z`;
     mk("path",{d,fill:"rgba(242,242,242,.18)"});
     mk("polyline",{points:vals.map((v,i)=>`${xs(i)},${ys(v)}`).join(" "),fill:"none",stroke:css("--fg"),"stroke-width":1.5});
@@ -404,6 +408,12 @@ $("bFirst").onclick=()=>{ply=0;render();}; $("bLast").onclick=()=>{ply=line.leng
 $("bPrev").onclick=()=>{ply=Math.max(0,ply-1);render();}; $("bNext").onclick=()=>{ply=Math.min(line.length,ply+1);render();};
 $("bUndo").onclick=()=>{ if(!line.length) return; if(!mainLine) mainLine=line.slice(); line=line.slice(0,Math.max(0,ply-1)); rebuild(); ply=line.length; render(); };
 $("bFlip").onclick=()=>{flipped=!flipped; render(); toast(flipped?"Чёрные снизу":"Белые снизу");};
+// Макет: «Глубокий анализ» только показывает поведение (прогресс 20 с, повторный клик или Esc отменяют).
+let deepT=null;
+function deepStop(){ clearInterval(deepT); deepT=null; $("deepProg").hidden=true; $("bDeep").classList.remove("busy"); $("deepLbl").textContent=" Глубокий анализ"; $("anaMsg").textContent=""; }
+$("bDeep").onclick=()=>{ if(deepT){deepStop();return;} let t=0; $("deepProg").hidden=false; $("bDeep").classList.add("busy"); $("deepLbl").textContent=" Отменить (Esc)";
+  deepT=setInterval(()=>{ t++; $("deepProg").value=t; $("anaMsg").textContent="Глубокий анализ: "+t+" из 20 с"; if(t>=20){ deepStop(); $("anaMsg").textContent="Глубокий, 20 с."; } },1000); };
+document.addEventListener("keydown",e=>{ if(e.key==="Escape"&&deepT) deepStop(); });
 $("bHint").onclick=()=>{hintOn=!hintOn; $("bHint").classList.toggle("on",hintOn); $("hintLbl").textContent=" Подсказка: "+(hintOn?"вкл":"выкл"); render();};
 $("bRestore").onclick=()=>{ line=mainLine; mainLine=null; rebuild(); ply=Math.min(ply,line.length); render(); toast("Партия восстановлена"); };
 $("bNew").onclick=()=>{ line=[]; mainLine=null; rebuild(); ply=0; render(); };

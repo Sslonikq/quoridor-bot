@@ -202,6 +202,16 @@ def test_hint_within_3s_at_time_2(server):
     assert elapsed <= 3.0, elapsed
 
 
+@pytest.mark.slow
+def test_hint_at_the_default_time_reports_depth(server):
+    """No "time" in the request: engine.DEFAULT_TIME (5 s) for the whole hint."""
+    t0 = time.perf_counter()
+    status, res = post(server, "/api/analyze", {"moves": ["e2", "e8"]})
+    elapsed = time.perf_counter() - t0
+    assert status == 200 and len(res["top"]) == 3 and res["depth"] >= 6
+    assert elapsed <= 5.5, elapsed
+
+
 GAME01 = [
     t
     for line in (Path(__file__).parents[1] / "fixtures/games/game01.txt")
@@ -213,7 +223,7 @@ GAME01 = [
 
 
 @pytest.mark.slow
-@pytest.mark.parametrize("n", [20, 30, 40, 50, len(GAME01) - 4, len(GAME01) - 1])
+@pytest.mark.parametrize("n", [3, 18, 20, 30, 40, 50, len(GAME01) - 4, len(GAME01) - 1])
 def test_hint_within_3s_at_time_2_game01_positions(server, n):
     t0 = time.perf_counter()
     status, res = post(server, "/api/analyze", {"moves": GAME01[:n], "time": 2})
@@ -273,6 +283,35 @@ def test_oversized_body_and_bad_time(server):
     assert status == 413
     assert post(server, "/api/analyze", {"moves": [], "time": "2"})[0] == 400
     assert post(server, "/api/analyze", {"moves": [], "time": True})[0] == 400
+
+
+def test_explicit_time_up_to_30_is_accepted(server, monkeypatch):
+    """Deep analysis sends time=20; the server passes it on unclamped (max 30)."""
+    from quoridor.analyzer import engine
+
+    seen = []
+
+    def fake(moves, seconds, cancelled):
+        seen.append(seconds)
+        return {"cancelled": True}
+
+    monkeypatch.setattr(engine, "analyze", fake)
+    for t in (20, 30, 0.5):
+        assert post(server, "/api/analyze", {"moves": [], "time": t})[0] == 200
+    assert seen == [20.0, 30.0, 0.5]
+    assert engine.DEFAULT_TIME == 5.0 and engine.DEEP_TIME == 20.0
+
+
+@pytest.mark.parametrize(
+    "bad", [31, 30.01, 1e9, float("inf"), float("nan"), 0, -1, True, "20", None]
+)
+@pytest.mark.parametrize("route", ["/api/analyze", "/api/evaluate", "/api/review"])
+def test_bad_explicit_time_is_rejected(server, route, bad):
+    body = {"moves": ["e2"], "time": bad}
+    if route == "/api/evaluate":
+        body["move"] = "e8"
+    status, res = post(server, route, body)
+    assert status == 400 and "time" in res["error"]
 
 
 def test_not_reachable_through_a_non_loopback_address(server):
@@ -356,3 +395,59 @@ def test_handler_has_a_socket_timeout():
     from quoridor.analyzer.server import Handler
 
     assert Handler.timeout and Handler.timeout <= 30
+
+
+def test_cancel_stops_the_running_analysis(server):
+    out = {}
+
+    def run():
+        out["a"] = post(server, "/api/analyze", {"moves": [], "time": 8})
+
+    t = threading.Thread(target=run)
+    t0 = time.perf_counter()
+    t.start()
+    time.sleep(0.4)
+    assert post(server, "/api/cancel", {}) == (200, {"ok": True})
+    t.join(5)
+    assert not t.is_alive() and time.perf_counter() - t0 < 4
+    assert out["a"][0] == 200 and out["a"][1]["cancelled"] is True
+    assert post(server, "/api/cancel", {}) == (200, {"ok": True})  # nothing running: harmless
+
+
+def test_evaluate_scores_the_given_move(server):
+    status, res = post(server, "/api/evaluate", {"moves": ["e2", "e8"], "move": "e3", "time": 0.3})
+    assert status == 200 and res["ok"] and not res["cancelled"]
+    assert res["name"] == "e3" and res["k"] == "p" and (res["c"], res["r"]) == (4, 2)
+    assert isinstance(res["score"], int) and res["depth"] >= 1 and res["why"]
+    status, res = post(server, "/api/evaluate", {"moves": ["e2", "e8"], "move": "e3h", "time": 0.3})
+    assert status == 200 and res["k"] == "w" and res["name"] == "e3h"
+
+
+@pytest.mark.parametrize(
+    ("moves", "move", "bad"),
+    [
+        (["e2", "e8"], "e5", 3),  # not a legal move
+        (["e2", "e8"], "zz", 3),
+        (["e2", "e8"], 7, 3),
+        (["e2", "e8"], None, 3),
+        (["e2", "e5"], "e3", 2),  # bad history: the number is in "moves"
+        (WIN_WHITE, "e1", len(WIN_WHITE) + 1),  # the game is over
+    ],
+)
+def test_evaluate_rejects_bad_input(server, moves, move, bad):
+    status, res = post(server, "/api/evaluate", {"moves": moves, "move": move, "time": 0.2})
+    assert status == 400 and res["ok"] is False and res["bad_move"] == bad
+
+
+def test_rejected_evaluate_does_not_cancel_the_running_analysis(server):
+    out = {}
+
+    def run():
+        out["a"] = post(server, "/api/analyze", {"moves": [], "time": 1.0})
+
+    t = threading.Thread(target=run)
+    t.start()
+    time.sleep(0.3)
+    assert post(server, "/api/evaluate", {"moves": [], "move": "e5"})[0] == 400
+    t.join(10)
+    assert out["a"][0] == 200 and not out["a"][1].get("cancelled")
