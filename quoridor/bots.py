@@ -11,8 +11,8 @@ import time
 from collections.abc import Callable, Mapping
 from typing import Protocol
 
-from quoridor.eval import WALL, WALL_V3
-from quoridor.frozen import search_v1
+from quoridor.eval import RESERVE_V4, THREAT_V4, WALL, WALL_V3
+from quoridor.frozen import search_v1, search_v4
 from quoridor.paths import shortest_path, shortest_path_length
 from quoridor.rules import apply_move_unchecked, is_wall_legal, legal_moves, pawn_moves
 from quoridor.search import DEFAULT_WALL_LIMIT, V2_TT_BITS, Searcher, SearchResult
@@ -150,7 +150,8 @@ class SearchBot:
       depth     -- max search depth in plies (fixed depth + no time = deterministic);
       move_time -- seconds per move;
       game_time -- own clock for the whole game: per-move budget from quoridor.timeman.
-    tt_bits > 0 turns on the transposition table of 2**tt_bits entries (v2).
+    tt_bits > 0 turns on the transposition table of 2**tt_bits entries (v2); v4=1 the v4
+    eval (search.Searcher.wall_race when a side has no walls left).
     The seed only breaks ties between equally scored root moves.
     """
 
@@ -164,6 +165,13 @@ class SearchBot:
         wall_weight: int = WALL,
         searcher: SearcherLike | None = None,
         tt_bits: int = 0,
+        v4: int = 0,
+        pvs: int = 0,
+        lmr: int = 0,
+        delay_slack: int = 0,
+        threat: int = 0,
+        root_defense: int = 0,
+        reserve: int = 0,
     ) -> None:
         if depth is None and move_time is None and game_time is None:
             raise ValueError("SearchBot needs depth, move_time or game_time")
@@ -181,6 +189,13 @@ class SearchBot:
                     ("wall_limit", wall_limit, DEFAULT_WALL_LIMIT),
                     ("wall_weight", wall_weight, WALL),
                     ("tt_bits", tt_bits, 0),
+                    ("v4", v4, 0),
+                    ("pvs", pvs, 0),
+                    ("lmr", lmr, 0),
+                    ("delay_slack", delay_slack, 0),
+                    ("threat", threat, 0),
+                    ("root_defense", root_defense, 0),
+                    ("reserve", reserve, 0),
                 )
                 if val != default
             ]
@@ -190,7 +205,19 @@ class SearchBot:
                     "configure the injected searcher instead"
                 )
         self._searcher: SearcherLike = (
-            Searcher(seed, wall_limit=wall_limit, wall_weight=wall_weight, tt_bits=tt_bits)
+            Searcher(
+                seed,
+                wall_limit=wall_limit,
+                wall_weight=wall_weight,
+                tt_bits=tt_bits,
+                v4=v4,
+                pvs=pvs,
+                lmr=lmr,
+                delay_slack=delay_slack,
+                threat=threat,
+                root_defense=root_defense,
+                reserve=reserve,
+            )
             if searcher is None
             else searcher
         )
@@ -282,6 +309,77 @@ def make_v2_fast(seed: int) -> SearchBot:
     return SearchBot(seed, move_time=FAST_MOVE_TIME, tt_bits=V2_TT_BITS)
 
 
+V4_DEPTH = V1_DEPTH  # fixed-depth variant for deterministic tests; strength is at equal time
+# Searcher settings of v4 (also used by the analyzer): v3 + the v4 eval.
+V4_SETTINGS: dict[str, int] = {
+    "tt_bits": V2_TT_BITS,
+    "wall_weight": WALL_V3,
+    "v4": 1,
+    "pvs": 1,
+    "lmr": 3,
+    "delay_slack": 2,
+    "threat": THREAT_V4,
+    "root_defense": 3,
+    # report 0066: the opponent's wall stock as a threat while we have 0-2 walls; at 3 s
+    # 64.5% against v4-frozen and 64.0% against v3 (100 games each)
+    "reserve": RESERVE_V4,
+}
+
+
+def make_v4(seed: int) -> SearchBot:
+    """v3 + the v4 eval (report 0061), fixed depth V4_DEPTH."""
+    return SearchBot(seed, depth=V4_DEPTH, **V4_SETTINGS)
+
+
+def make_v4_clock(seed: int) -> SearchBot:
+    """v4 on a 10-minute game clock (the version for real games, default in cli)."""
+    return SearchBot(seed, game_time=GAME_TIME, **V4_SETTINGS)
+
+
+def make_v4_fast(seed: int) -> SearchBot:
+    """v4 with FAST_MOVE_TIME per move (equal-time comparison; not deterministic)."""
+    return SearchBot(seed, move_time=FAST_MOVE_TIME, **V4_SETTINGS)
+
+
+MATCH_MOVE_TIME = 3.0  # seconds per move for the equal-time matches at a realistic control
+
+
+def make_v3_match(seed: int) -> SearchBot:
+    """v3 with MATCH_MOVE_TIME per move (equal-time matches at 3 s; not deterministic)."""
+    return SearchBot(
+        seed, move_time=MATCH_MOVE_TIME, tt_bits=V2_TT_BITS, wall_weight=V3_WALL_WEIGHT
+    )
+
+
+def make_v4_match(seed: int) -> SearchBot:
+    """v4 with MATCH_MOVE_TIME per move (equal-time matches at 3 s; not deterministic)."""
+    return SearchBot(seed, move_time=MATCH_MOVE_TIME, **V4_SETTINGS)
+
+
+def make_v4_frozen(seed: int) -> SearchBot:
+    """v4 exactly as in reports 0061/0062 (quoridor/frozen/search_v4.py), depth V4_DEPTH.
+
+    A fixed baseline: unlike "v4" it does not change when search.py / eval.py /
+    V4_SETTINGS do.
+    """
+    return SearchBot(seed, depth=V4_DEPTH, searcher=search_v4.make_searcher(seed))
+
+
+def make_v4_frozen_fast(seed: int) -> SearchBot:
+    """The frozen v4 with FAST_MOVE_TIME per move."""
+    return SearchBot(seed, move_time=FAST_MOVE_TIME, searcher=search_v4.make_searcher(seed))
+
+
+def make_v4_frozen_match(seed: int) -> SearchBot:
+    """The frozen v4 with MATCH_MOVE_TIME per move."""
+    return SearchBot(seed, move_time=MATCH_MOVE_TIME, searcher=search_v4.make_searcher(seed))
+
+
+def make_v4_frozen_clock(seed: int) -> SearchBot:
+    """The frozen v4 on a 10-minute game clock."""
+    return SearchBot(seed, game_time=GAME_TIME, searcher=search_v4.make_searcher(seed))
+
+
 # Single source of truth for the move limit and the bot registry (used by cli and arena).
 DEFAULT_MAX_MOVES = 300
 BotFactory = Callable[[int], Bot]
@@ -301,6 +399,15 @@ BOTS: dict[str, BotFactory] = {
     "v3": make_v3,
     "v3-clock": make_v3_clock,
     "v3-0.2s": make_v3_fast,
+    "v4": make_v4,
+    "v4-clock": make_v4_clock,
+    "v4-0.2s": make_v4_fast,
+    "v3-3s": make_v3_match,
+    "v4-3s": make_v4_match,
+    "v4-frozen": make_v4_frozen,
+    "v4-frozen-clock": make_v4_frozen_clock,
+    "v4-frozen-0.2s": make_v4_frozen_fast,
+    "v4-frozen-3s": make_v4_frozen_match,
 }
 # Bots whose play does not depend on the seed in a meaningful way (seed only breaks ties):
 # a mirror match of such a bot repeats the same game.

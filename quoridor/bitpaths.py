@@ -81,6 +81,42 @@ def distance(m: Masks, start: int, goal: int) -> int | None:
     return None
 
 
+def shortest_layers(m: Masks, start: int, goal: int) -> list[int] | None:
+    """Cells on shortest paths from the start bit to `goal`, layer by layer.
+
+    Returns [L_0, ..., L_d] (d = distance; L_0 = start, L_d = the goal cells reached at
+    distance d): L_k is the set of cells at distance k from the start lying on some
+    shortest path. None if the goal is unreachable. Edges are undirected, so the
+    backward pass uses the same masks.
+    """
+    up, down, right, left = m
+    fronts = [start]
+    seen = front = start
+    while not front & goal:
+        front = (
+            ((front & up) << N)
+            | ((front & down) >> N)
+            | ((front & right) << 1)
+            | ((front & left) >> 1)
+        ) & ~seen
+        if not front:
+            return None
+        seen |= front
+        fronts.append(front)
+    layer = front & goal
+    out = [layer]
+    for k in range(len(fronts) - 2, -1, -1):
+        layer = fronts[k] & (
+            ((layer & up) << N)
+            | ((layer & down) >> N)
+            | ((layer & right) << 1)
+            | ((layer & left) >> 1)
+        )
+        out.append(layer)
+    out.reverse()
+    return out
+
+
 def player_distance(m: Masks, cell: Cell, player: int) -> int | None:
     return distance(m, bit(cell), GOAL_MASK[player])
 

@@ -32,6 +32,24 @@
 * Limits: fixed depth (deterministic, for the arena/tests) and/or a time budget. On
   timeout the result of the last completed iteration (or a fully searched improvement
   from the current one) is returned. Root ties are broken by a seeded shuffle.
+* Proven loss at the root (report 0053): every move loses, so the plain search would
+  return any of the slowest losses. Instead all root moves and every legal wall that
+  lengthens the opponent's path (not only the pruned set) are re-checked with a null
+  window at the same depth; among those that lose no faster (or do not lose) the move
+  with the largest (opponent - own) distance, then opponent distance, is played. Only
+  proven-lost positions are affected.
+* search_root: scores of all (or the best `top`) root moves with one shared window (the
+  `top`-th best exact score so far) and one TT; search_top: the ordinary search for the
+  best move plus a cheap search_root of the other root moves for the analyzer's top-N.
+* Displayed scores: the static eval ignores the tempo of the side to move, so the root
+  score swings by about one step between odd and even depths. display_score() adds half a
+  step (TEMPO) for the side to move at the leaves; move choice is not affected.
+* v4 (report 0061; options, off for v1-v3): eval.evaluate_v4 with wall_race when only one
+  side has walls left; PVS (null window after the first move, also at the root) and late
+  move reductions (moves from the lmr-th one on, one ply less at depth >= LMR_DEPTH, re-
+  searched on a fail high); delay_slack > 0: the practical choice in a proven-lost
+  position (_practical_loss). reserve > 0 (report 0066): eval.reserve_term, the
+  opponent's wall stock as a threat to our path while we have 0-2 walls ourselves.
 """
 
 from __future__ import annotations
@@ -43,7 +61,16 @@ from dataclasses import dataclass
 
 from quoridor import bitpaths
 from quoridor.bitpaths import GOAL_MASK, Masks, add_wall, bit, build_masks
-from quoridor.eval import WALL, WIN, evaluate_dists
+from quoridor.eval import (
+    PLAN_V4,
+    RACE_MIN_GAIN_V4,
+    SOFT_V4,
+    STEP,
+    WALL,
+    WIN,
+    evaluate_dists,
+    evaluate_v4,
+)
 from quoridor.rules import (
     apply_move_unchecked,
     legal_moves,
@@ -52,7 +79,18 @@ from quoridor.rules import (
     wall_fits,
     winner,
 )
-from quoridor.state import WALL_GRID, Cell, GameState, H, Move, PawnMove, V, WallMove, goal_row
+from quoridor.state import (
+    WALL_GRID,
+    WHITE,
+    Cell,
+    GameState,
+    H,
+    Move,
+    PawnMove,
+    V,
+    WallMove,
+    goal_row,
+)
 
 INF = WIN * 2
 MAX_DEPTH = 64
@@ -61,6 +99,12 @@ DEFAULT_WALL_LIMIT = 10
 # paths get a quarter each), so memory stays bounded however long the search runs.
 DEFAULT_CACHE_LIMIT = 300_000
 _CHECK_EVERY = 64  # nodes between clock checks
+LMR_DEPTH = 3  # late move reductions only at nodes with at least this remaining depth
+_NO_NODE_LIMIT = 1 << 62
+# _delay_loss without a clock (fixed depth): at most this many times the nodes of the
+# main search (and at least _DELAY_MIN_NODES), so a proven-lost position costs <= ~2x.
+_DELAY_NODE_SHARE = 1.0
+_DELAY_MIN_NODES = 2_000
 V2_TT_BITS = 18  # 2**18 = 262 144 entries (bounded memory, see report 0036)
 
 # ---- Zobrist keys (immutable module constants, fixed seed: reproducible) ----
@@ -139,6 +183,63 @@ class SearchResult:
     def nps(self) -> float:
         return self.nodes / self.elapsed if self.elapsed > 0 else 0.0
 
+    @property
+    def display_score(self) -> int:
+        """score without the odd/even depth swing (see display_score())."""
+        return display_score(self.score, self.depth + (1 if self.partial else 0))
+
+
+TEMPO = STEP // 2  # half a step: the side to move is half a step ahead in a race
+
+
+def display_score(score: int, depth: int) -> int:
+    """Root `score` of a `depth`-ply search with the tempo of the leaf's side to move.
+
+    The leaves are at ply `depth`: for odd depths the opponent of the root is to move
+    there, and the static eval does not credit it with its tempo, so the root score is
+    about half a step too high; for even depths half a step too low (measured: the start
+    position gives +100 / 0 at odd / even depths, game02 move 19 +500 / +400). Mate
+    scores are exact and unchanged. For display only: the search itself never uses it.
+    """
+    if is_win_score(score):
+        return score
+    return score - TEMPO if depth % 2 else score + TEMPO
+
+
+@dataclass(frozen=True)
+class RootScore:
+    """One root move scored by search_root / search_top (side-to-move view)."""
+
+    move: Move
+    score: int  # exact if `exact`, otherwise an upper bound
+    depth: int  # plies from the root (the root move included)
+    exact: bool
+
+
+@dataclass(frozen=True)
+class RootSearch:
+    scores: list[RootScore]  # exact scores best first, then upper bounds (best first)
+    depth: int  # last fully completed depth (0: nothing completed, scores empty)
+    nodes: int
+    elapsed: float
+
+
+@dataclass(frozen=True)
+class TopResult:
+    """search_top: the ordinary best move plus up to top_n - 1 alternatives.
+
+    `alts` carry display scores (display_score, never above the best move's one, and
+    never above the upper bound the main search proved for that move): comparable with
+    best.display_score. Upper-bound entries (exact=False) fill the list only if fewer
+    exact scores were found.
+    """
+
+    best: SearchResult
+    alts: list[RootScore]
+    alt_depth: int  # completed depth of the alternatives search (0: not run)
+    nodes: int
+    elapsed: float
+
 
 def edge_walls(a: Cell, b: Cell) -> tuple[WallMove, WallMove]:
     """The two wall placements (maybe off-grid) that block the edge between adjacent a, b."""
@@ -150,6 +251,29 @@ def edge_walls(a: Cell, b: Cell) -> tuple[WallMove, WallMove]:
     if nc == c + 1:
         return WallMove(c, r, V), WallMove(c, r - 1, V)
     return WallMove(c - 1, r, V), WallMove(c - 1, r - 1, V)
+
+
+def _edge_wall_table() -> dict[tuple[int, int], tuple[tuple, ...]]:
+    """(i, j) bit indexes (row * 9 + col) of adjacent cells -> in-grid walls blocking that
+    edge, as (x, y, orient, the four "not wall_bits" masks) for wall_race (no WallMove
+    objects in its inner loop)."""
+    out: dict[tuple[int, int], tuple[tuple, ...]] = {}
+    for c in range(9):
+        for r in range(9):
+            for dc, dr in ((0, 1), (0, -1), (1, 0), (-1, 0)):
+                nc, nr = c + dc, r + dr
+                if not (0 <= nc < 9 and 0 <= nr < 9):
+                    continue
+                ws = []
+                for w in edge_walls((c, r), (nc, nr)):
+                    if 0 <= w.x < WALL_GRID and 0 <= w.y < WALL_GRID:
+                        b = bitpaths.wall_bits(w.x, w.y, w.orient)
+                        ws.append((w.x, w.y, w.orient, ~b[0], ~b[1], ~b[2], ~b[3]))
+                out[r * 9 + c, nr * 9 + nc] = tuple(ws)
+    return out
+
+
+_EDGE_WALLS = _edge_wall_table()
 
 
 def is_win_score(score: int) -> bool:
@@ -175,10 +299,33 @@ class Searcher:
         wall_weight: int = WALL,
         cache_limit: int = DEFAULT_CACHE_LIMIT,
         tt_bits: int = 0,
+        v4: int = 0,
+        pvs: int = 0,
+        lmr: int = 0,
+        delay_slack: int = 0,
+        threat: int = 0,
+        root_defense: int = 0,
+        reserve: int = 0,
     ) -> None:
         self._rng = random.Random(seed)
         self.wall_limit = wall_limit
         self.wall_weight = wall_weight
+        self.v4 = v4  # 0: v1-v3 eval; 1: v4 eval (wall race when one side has no walls)
+        self.pvs = bool(pvs)  # principal variation search (null windows after the 1st move)
+        self.lmr = lmr if pvs else 0  # with pvs: reduce moves from this index on (0: off)
+        # proven loss: 0 = the slowest loss (v3); > 0 = _practical_loss with this slack
+        self.delay_slack = delay_slack
+        # root only: our walls against the opponent's best root_defense walls (0: off)
+        self.root_defense = root_defense
+        # per step of (our best single wall - the opponent's), while both have walls
+        self.threat = threat  # (v4: eval.THREAT_V4; 0: off)
+        self._race_cache: dict[tuple, tuple[int, int]] = {}
+        self._race_cands_cache: dict[tuple, tuple] = {}
+        self.race_plan = PLAN_V4
+        self.race_soft = SOFT_V4
+        self.race_min_gain = RACE_MIN_GAIN_V4
+        # v4 eval: per opponent wall when we have few walls (eval.reserve_term; 0: off)
+        self.reserve = reserve
         self.cache_limit = max(1, cache_limit)
         self._small_limit = max(1, cache_limit // 4)
         self.tt_bits = max(0, tt_bits)  # 0: no transposition table (v1)
@@ -190,6 +337,10 @@ class Searcher:
         self._killers: list[Move | None] = [None] * (MAX_DEPTH + 2)  # by ply
         self.nodes = 0
         self._deadline: float | None = None
+        # Node cap, checked only together with the deadline (see _delay_loss).
+        self._node_limit = _NO_NODE_LIMIT
+        # (root moves, child keys, scores, depth) of search()'s last completed iteration
+        self._root_info: tuple | None = None
 
     # ---------- helpers ----------
 
@@ -236,13 +387,135 @@ class Searcher:
         d_me = self.dist(state, me)
         d_op = self.dist(state, 1 - me)
         assert d_me is not None and d_op is not None
-        return evaluate_dists(
-            d_me,
-            d_op,
-            state.walls_left[me],
-            state.walls_left[1 - me],
-            wall_weight=self.wall_weight,
-        )
+        wm, wo = state.walls_left[me], state.walls_left[1 - me]
+        if self.v4:
+            e_me, e_op = d_me, d_op
+            # exactly one side (A) has walls left and does not win the pure race anyway
+            # (then RACE decides and A's wall plan is not needed)
+            if (wm == 0) != (wo == 0) and (d_op < d_me if wm else d_me <= d_op):
+                if wo:  # only the opponent has walls: its plan against us
+                    e_op, e_me = self.wall_race(state, 1 - me)
+                else:
+                    e_me, e_op = self.wall_race(state, me)
+            score = evaluate_v4(
+                d_me,
+                d_op,
+                wm,
+                wo,
+                e_me,
+                e_op,
+                plan=self.race_plan,
+                soft=self.race_soft,
+                wall_weight=self.wall_weight,
+                reserve=self.reserve,
+            )
+            if self.threat and wm and wo:
+                # both sides have walls: our best single wall against theirs
+                m = self.masks(state)
+                h, v = state.h_walls, state.v_walls
+                d, c, *_ = self._race_cands(m, h, v, state.pawns[1 - me], 1 - me)
+                g_me = c[0][0] - d if c else 0
+                d, c, *_ = self._race_cands(m, h, v, state.pawns[me], me)
+                g_op = c[0][0] - d if c else 0
+                score += self.threat * (g_me - g_op)
+            return score
+        return evaluate_dists(d_me, d_op, wm, wo, wall_weight=self.wall_weight)
+
+    def wall_race(self, state: GameState, a: int) -> tuple[int, int]:
+        """(moves A needs, moves B needs) after A's greedy wall plan.
+
+        A = player `a` (it has walls), B = the other one. Greedy: while A has walls, place
+        the legal-looking wall (it fits; blocking an edge of B's current shortest paths:
+        any wall that lengthens them must) that lengthens B's path most; stop when the
+        best one adds < race_min_gain steps (a wall costs A a move, so +1 wins nothing).
+        A's pawn is ignored (its own detours and walls that would cut it off: rare), so
+        the plan depends on the walls and B's pawn only and is shared by all positions of
+        A's pawn; pawns stand still and jumps are ignored: an estimate, not a proof.
+        Memoised per search (bounded like the distance cache).
+        """
+        n = state.walls_left[a]
+        b = 1 - a
+        b_cell = state.pawns[b]
+        key = (state.h_walls, state.v_walls, b_cell, b, n)
+        cache = self._race_cache
+        hit = cache.get(key)
+        if hit is None:
+            m = self.masks(state)
+            h = set(state.h_walls)
+            v = set(state.v_walls)
+            min_gain = self.race_min_gain
+            used = 0
+            while True:
+                d_b, cands = self._race_cands(m, h, v, b_cell, b)
+                if used >= n or not cands or cands[0][0] - d_b < min_gain:
+                    break
+                _, m, w = cands[0]
+                (h if w[2] == H else v).add((w[0], w[1]))
+                used += 1
+            hit = (used, d_b)
+            if len(cache) >= self._small_limit:
+                cache.clear()
+            cache[key] = hit
+        used, d_b = hit
+        d_a = self.dist(state, a)
+        assert d_a is not None
+        return d_a + used, d_b
+
+    def _race_cands(
+        self, m: Masks, h: set, v: set, b_cell: Cell, b: int
+    ) -> tuple[int, list[tuple[int, Masks, tuple]]]:
+        """(B's distance, [(B's distance after the wall, child masks, (x, y, orient))])
+        for the walls that fit (h / v: the wall set of `m`) and lengthen B's path, by
+        B's new distance (best first). Memoised by (m, b_cell, b)."""
+        key = (m, b_cell, b)
+        cache = self._race_cands_cache
+        hit = cache.get(key)
+        if hit is not None:
+            return hit
+        start, goal = bit(b_cell), GOAL_MASK[b]
+        layers = bitpaths.shortest_layers(m, start, goal)
+        assert layers is not None
+        d_b = len(layers) - 1
+        m0, m1, m2, m3 = m
+        distance = bitpaths.distance
+        seen: set[tuple[int, int, str]] = set()
+        cands: list[tuple[int, tuple, Masks, tuple]] = []
+        # A wall blocks two parallel edges, so it lengthens B's path only if it blocks
+        # every shortest-path edge between two consecutive layers: both have <= 2 cells.
+        for k in range(d_b):
+            lk, lk1 = layers[k], layers[k + 1]
+            if lk.bit_count() > 2 or lk1.bit_count() > 2:
+                continue
+            us = [i for i in range(81) if lk >> i & 1] if lk & (lk - 1) else [lk.bit_length() - 1]
+            for u in us:
+                for j, ok in ((u + 9, m0), (u - 9, m1), (u + 1, m2), (u - 1, m3)):
+                    if not (ok >> u) & 1 or not (lk1 >> j) & 1:
+                        continue
+                    for x, y, o, n0, n1, n2, n3 in _EDGE_WALLS[u, j]:
+                        w = (x, y, o)
+                        if w in seen:
+                            continue
+                        seen.add(w)
+                        if (x, y) in h or (x, y) in v:
+                            continue
+                        if o == H:
+                            if (x - 1, y) in h or (x + 1, y) in h:
+                                continue
+                        elif (x, y - 1) in v or (x, y + 1) in v:
+                            continue
+                        cm = (m0 & n0, m1 & n1, m2 & n2, m3 & n3)
+                        nb = distance(cm, start, goal)
+                        if nb is not None and nb > d_b:
+                            # ties: by the wall seen from B's side of the board, so that
+                            # a position and its colour mirror get the same plan
+                            yb = y if b == WHITE else WALL_GRID - 1 - y
+                            cands.append((nb, (x, yb, o), cm, w))
+        cands.sort(key=lambda t: (-t[0], t[1]))
+        res = (d_b, [(nb, cm, w) for nb, _, cm, w in cands])
+        if len(cache) >= self._small_limit:
+            cache.clear()
+        cache[key] = res
+        return res
 
     def candidate_walls(self, state: GameState) -> list[tuple[int, WallMove, GameState]]:
         """(gain, wall, child) for pruned legal walls, best gain first (stable).
@@ -416,7 +689,7 @@ class Searcher:
         if (
             self._deadline is not None
             and self.nodes % _CHECK_EVERY == 0
-            and time.perf_counter() > self._deadline
+            and (time.perf_counter() > self._deadline or self.nodes > self._node_limit)
         ):
             raise SearchTimeout
         if winner(state) is not None:  # the previous mover has reached its goal
@@ -501,9 +774,21 @@ class Searcher:
         # Children of a depth-1 node are leaves (depth 0): they never probe or store the
         # table, so their key is not needed.
         need_key = tt is not None and depth > 1
+        # PVS (v4): moves after the first one get a null window first, and with LMR the
+        # moves from the lmr-th one on also one ply less; a fail-high is re-searched.
+        pvs = self.pvs
+        late = self.lmr if self.lmr and depth >= LMR_DEPTH else MAX_DEPTH * 1000
+        i = 0
         for mv, child in self._children(state, first, good, walls, other, skip_wall):
             ck = child_key(key, state, mv) if need_key else 0
-            v = -self._negamax(child, depth - 1, -beta, -alpha, ply + 1, ck)
+            if not pvs or i == 0:
+                v = -self._negamax(child, depth - 1, -beta, -alpha, ply + 1, ck)
+            else:
+                r = 1 if i >= late else 0
+                v = -self._negamax(child, depth - 1 - r, -alpha - 1, -alpha, ply + 1, ck)
+                if v > alpha and (r or v < beta):
+                    v = -self._negamax(child, depth - 1, -beta, -alpha, ply + 1, ck)
+            i += 1
             if v > best:
                 best = v
                 best_move = mv
@@ -521,6 +806,48 @@ class Searcher:
             tt[key & self._tt_mask] = (key, depth, _to_tt(best, ply), bound, best_move)
         return best
 
+    # ---------- root ----------
+
+    def _reset(self, state: GameState) -> None:
+        """Fresh memo caches, killers and (if on) an empty TT for one search call."""
+        self.nodes = 0
+        self._dist_cache = {}
+        self._mask_cache = {}
+        self._path_cache = {}
+        self._race_cache = {}
+        self._race_cands_cache = {}
+        self._killers = [None] * (MAX_DEPTH + 2)
+        self._deadline = None
+        self._node_limit = _NO_NODE_LIMIT
+        use_tt = self.tt_bits > 0 and max(state.walls_left) < _ZMAX_WALLS
+        self._tt = {} if use_tt else None  # lazily filled slots, at most 2**tt_bits
+        self._root_info = None
+
+    def _free(self) -> None:
+        """Drop everything big, so that nothing is held between calls."""
+        self._dist_cache = {}
+        self._mask_cache = {}
+        self._path_cache = {}
+        self._race_cache = {}
+        self._race_cands_cache = {}
+        self._tt = None
+        self._deadline = None
+        self._node_limit = _NO_NODE_LIMIT
+        self._root_info = None
+
+    def _keys(self, state: GameState, root: list[tuple[Move, GameState]]) -> list[int]:
+        if self._tt is None:
+            return [0] * len(root)
+        rk = zobrist(state)
+        return [child_key(rk, state, m) for m, _ in root]
+
+    @staticmethod
+    def _check_args(state: GameState, max_depth: int | None, time_limit: float | None) -> None:
+        if winner(state) is not None:
+            raise ValueError("no legal moves (terminal position)")
+        if max_depth is None and time_limit is None:
+            raise ValueError("need max_depth or time_limit")
+
     def search(
         self,
         state: GameState,
@@ -534,32 +861,22 @@ class Searcher:
         freed on return, so nothing big is held between moves.
         """
         try:
+            self._check_args(state, max_depth, time_limit)
+            self._reset(state)
             return self._search(state, max_depth, time_limit)
         finally:
-            self._dist_cache = {}
-            self._mask_cache = {}
-            self._path_cache = {}
-            self._tt = None
-            self._deadline = None
+            self._free()
 
     def _search(
         self, state: GameState, max_depth: int | None, time_limit: float | None
     ) -> SearchResult:
-        if winner(state) is not None:
-            raise ValueError("no legal moves (terminal position)")
-        if max_depth is None and time_limit is None:
-            raise ValueError("need max_depth or time_limit")
+        """Iterative deepening at the root (after _reset; the caches are kept).
+
+        Leaves the root moves and their scores of the last completed iteration in
+        self._root_info (for search_top).
+        """
         limit_depth = MAX_DEPTH if max_depth is None else max(1, max_depth)
         t0 = time.perf_counter()
-        self.nodes = 0
-        self._dist_cache = {}
-        self._killers = [None] * (MAX_DEPTH + 2)
-        self._mask_cache = {}
-        self._path_cache = {}
-        self._deadline = None
-        use_tt = self.tt_bits > 0 and max(state.walls_left) < _ZMAX_WALLS
-        self._tt = {} if use_tt else None  # lazily filled slots, at most 2**tt_bits
-
         pawns = pawn_moves(state)
         goal = goal_row(state.turn)
         for m in pawns:
@@ -567,6 +884,8 @@ class Searcher:
                 return SearchResult(m, WIN - 1, 1, 1, time.perf_counter() - t0)
 
         root = self.ordered_moves(state, pawns)
+        if self.root_defense:
+            root += self._defensive_walls(state, {m for m, _ in root})
         if not root:  # boxed pawn and no useful wall: fall back to any legal move
             root = [(m, apply_move_unchecked(state, m)) for m in legal_moves(state)]
         # Seeded tie-break: a random rank per root move; sorts use it after the score.
@@ -574,11 +893,11 @@ class Searcher:
         self._rng.shuffle(order)
         prio = {i: rank for rank, i in enumerate(order)}
         idx = list(range(len(root)))
-        rk = zobrist(state) if use_tt else 0
-        keys = [child_key(rk, state, m) if use_tt else 0 for m, _ in root]
+        keys = self._keys(state, root)
         best_move: Move = root[0][0]
         best_score = -INF
         done_depth = 0
+        done_scores: list[int] = []
         partial = False
 
         for depth in range(1, limit_depth + 1):
@@ -591,7 +910,12 @@ class Searcher:
             scores = [-INF] * len(root)
             try:
                 for i in idx:
-                    v = -self._negamax(root[i][1], depth - 1, -INF, -alpha, 1, keys[i])
+                    if self.pvs and iter_best_i >= 0:
+                        v = -self._negamax(root[i][1], depth - 1, -alpha - 1, -alpha, 1, keys[i])
+                        if v > alpha:  # fail high: the exact score
+                            v = -self._negamax(root[i][1], depth - 1, -INF, -alpha, 1, keys[i])
+                    else:
+                        v = -self._negamax(root[i][1], depth - 1, -INF, -alpha, 1, keys[i])
                     scores[i] = v  # exact if > alpha, otherwise an upper bound
                     if iter_best_i < 0 or v > alpha:
                         alpha = v
@@ -604,6 +928,7 @@ class Searcher:
                     partial = done_depth > 0
                 break
             done_depth = depth
+            done_scores = scores
             # Next iteration: best first; ties keep the seeded order.
             idx.sort(key=lambda i: (-scores[i], prio[i]))
             if depth == 1:
@@ -611,7 +936,381 @@ class Searcher:
             best_move, best_score = root[iter_best_i][0], scores[iter_best_i]
             if is_win_score(best_score) or len(root) == 1:
                 break
+        if best_score <= -(WIN - 10_000):  # proven loss: play the longest resistance
+            best_move, best_score = self._delay_loss_limited(
+                state, root, keys, prio, done_depth, partial, best_move, best_score, t0, time_limit
+            )
         self._deadline = None
+        self._root_info = (root, keys, done_scores, done_depth)
         return SearchResult(
             best_move, best_score, done_depth, self.nodes, time.perf_counter() - t0, partial
         )
+
+    def _delay_loss_limited(
+        self,
+        state: GameState,
+        root: list[tuple[Move, GameState]],
+        keys: list[int],
+        prio: dict[int, int],
+        done_depth: int,
+        partial: bool,
+        best_move: Move,
+        best_score: int,
+        t0: float,
+        time_limit: float | None,
+    ) -> tuple[Move, int]:
+        """_delay_loss inside the move's budget (review 0057, minor 3).
+
+        With a clock: skipped once its deadline t0 + time_limit has passed (also when
+        only depth 1 ran and no deadline was set yet). Without one (fixed depth): a node
+        cap of _DELAY_NODE_SHARE x the main search's nodes (>= _DELAY_MIN_NODES), so the
+        result stays deterministic; on hitting it the candidates checked so far count.
+        """
+        if time_limit is not None:
+            self._deadline = t0 + time_limit
+            if time.perf_counter() >= self._deadline:
+                return best_move, best_score
+        else:
+            self._deadline = float("inf")  # turns on the node-cap check in _negamax
+            budget = max(_DELAY_MIN_NODES, int(self.nodes * _DELAY_NODE_SHARE))
+            self._node_limit = self.nodes + budget
+        try:
+            sd = done_depth + (1 if partial else 0)
+            return self._delay_loss(
+                state, root, keys, prio, sd, best_move, best_score, exact_root=not partial
+            )
+        finally:
+            self._node_limit = _NO_NODE_LIMIT
+
+    def _defensive_walls(
+        self, state: GameState, have: set[Move]
+    ) -> list[tuple[WallMove, GameState]]:
+        """Root only (root_defense > 0): our walls that take away the opponent's best
+        walls against us (gain >= 2, the root_defense best ones): the wall overlaps or
+        crosses the threat, so it no longer fits. Kept if it is legal, not in `have`
+        and does not lengthen our path more than the opponent's. Such walls lengthen
+        nothing themselves, so candidate_walls never offers them (game03: the fence
+        on the 3rd row)."""
+        me = state.turn
+        if state.walls_left[me] <= 0 or state.walls_left[1 - me] <= 0:
+            return []
+        flipped = GameState(state.pawns, state.h_walls, state.v_walls, state.walls_left, 1 - me)
+        threats = [w for g, w, _ in self.candidate_walls(flipped) if g >= 2]
+        m = self.masks(state)
+        my_cell, op_cell = state.pawns[me], state.pawns[1 - me]
+        d_me = self.dist_m(m, my_cell, me)
+        d_op = self.dist_m(m, op_cell, 1 - me)
+        assert d_me is not None and d_op is not None
+        out: list[tuple[WallMove, GameState]] = []
+        seen = set(have)
+        for t in threats[: self.root_defense]:
+            x, y = t.x, t.y
+            if t.orient == H:
+                blockers = [WallMove(x - 1, y, H), WallMove(x + 1, y, H), WallMove(x, y, V)]
+            else:
+                blockers = [WallMove(x, y - 1, V), WallMove(x, y + 1, V), WallMove(x, y, H)]
+            blockers.append(t)  # taking the square first
+            for w in blockers:
+                if w in seen or not wall_fits(state, w):
+                    continue
+                seen.add(w)
+                cm = add_wall(m, w.x, w.y, w.orient)
+                me_after = self.dist_m(cm, my_cell, me)
+                op_after = self.dist_m(cm, op_cell, 1 - me)
+                if me_after is None or op_after is None:
+                    continue
+                if me_after - d_me > op_after - d_op:
+                    continue
+                child = apply_move_unchecked(state, w)
+                self._store_masks((child.h_walls, child.v_walls), cm)
+                out.append((w, child))
+        return out
+
+    def _lengthening_walls(self, state: GameState) -> list[tuple[WallMove, GameState]]:
+        """All legal walls that lengthen the opponent's shortest path (no gain filter or
+        wall_limit, unlike candidate_walls). Such a wall must block an edge of every
+        shortest path, so the edges of one path are enough."""
+        me = state.turn
+        if state.walls_left[me] <= 0:
+            return []
+        m = self.masks(state)
+        my_cell, op_cell = state.pawns[me], state.pawns[1 - me]
+        path = self.path_m(m, op_cell, 1 - me)
+        if not path:
+            return []
+        d_op = len(path) - 1
+        seen: set[WallMove] = set()
+        out: list[tuple[WallMove, GameState]] = []
+        for a, b in zip(path, path[1:], strict=False):
+            for w in edge_walls(a, b):
+                if w in seen or not (0 <= w.x < WALL_GRID and 0 <= w.y < WALL_GRID):
+                    continue
+                seen.add(w)
+                if not wall_fits(state, w):
+                    continue
+                cm = add_wall(m, w.x, w.y, w.orient)
+                op_after = self.dist_m(cm, op_cell, 1 - me)
+                if op_after is None or op_after <= d_op:
+                    continue
+                if self.dist_m(cm, my_cell, me) is None:
+                    continue  # cuts us off: illegal
+                child = apply_move_unchecked(state, w)
+                self._store_masks((child.h_walls, child.v_walls), cm)
+                out.append((w, child))
+        return out
+
+    def _delay_loss(
+        self,
+        state: GameState,
+        root: list[tuple[Move, GameState]],
+        keys: list[int],
+        prio: dict[int, int],
+        depth: int,
+        best_move: Move,
+        best_score: int,
+        exact_root: bool = True,
+    ) -> tuple[Move, int]:
+        """The best resistance in a position proven lost at `depth` (best_score = loss).
+
+        Candidates: the root moves plus every legal wall that lengthens the opponent's
+        path. Each is checked with a null window at the same depth: a move that loses
+        faster is dropped; one that is not worse than best_score gets its exact score by
+        a re-search (v >= best_score from the null window is only a lower bound), except
+        for root moves when `exact_root`: the main search at this depth already proved
+        them <= best_score, so v == best_score is exact there. Among the rest: the
+        latest loss (or the best score), then the largest (opponent - own) distance after
+        the move, then the opponent's distance, then the seeded root order. On timeout
+        the candidates checked so far are used (the searched best move is first).
+        """
+        me = state.turn
+        best_i = next(i for i, (m, _) in enumerate(root) if m == best_move)
+        cands: list[tuple[Move, GameState, int, int]] = [
+            (best_move, root[best_i][1], keys[best_i], prio[best_i])
+        ]
+        cands += [(m, c, keys[i], prio[i]) for i, (m, c) in enumerate(root) if i != best_i]
+        in_root = {m for m, _ in root}
+        rk = zobrist(state) if self._tt is not None else 0
+        extra = len(root)
+        for w, child in self._lengthening_walls(state):
+            if w not in in_root:
+                k = child_key(rk, state, w) if self._tt is not None else 0
+                cands.append((w, child, k, extra))
+                extra += 1
+        if self.delay_slack:
+            return self._practical_loss(state, cands, depth, best_move, best_score)
+        choice = (best_move, best_score)
+        best_key: tuple[int, int, int, int] | None = None
+        try:
+            for j, (m, child, k, p) in enumerate(cands):
+                if j == 0:
+                    v = best_score
+                else:
+                    v = -self._negamax(child, depth - 1, -best_score, -(best_score - 1), 1, k)
+                    if v < best_score:
+                        continue  # loses faster
+                    if v > best_score or not (exact_root and j < len(root)):
+                        # v is a lower bound only: the exact score (a fail-low here
+                        # means exactly best_score)
+                        w = -self._negamax(child, depth - 1, -INF, -best_score, 1, k)
+                        v = max(best_score, w)
+                d_me, d_op = self.dist(child, me), self.dist(child, 1 - me)
+                assert d_me is not None and d_op is not None
+                key = (v, d_op - d_me, d_op, -p)
+                if best_key is None or key > best_key:
+                    best_key, choice = key, (m, v)
+        except SearchTimeout:
+            pass
+        return choice
+
+    def _practical_loss(
+        self,
+        state: GameState,
+        cands: list[tuple[Move, GameState, int, int]],
+        depth: int,
+        best_move: Move,
+        best_score: int,
+    ) -> tuple[Move, int]:
+        """v4's choice in a proven-lost position (delay_slack > 0, report 0061).
+
+        Against a human a proven loss is not the end, but playing only for the slowest
+        loss makes the pawn walk back and forth (game03, moves 21-33: retreating in front
+        of the opponent so that it gets no jump). Here every candidate that loses at most
+        delay_slack plies faster than the searched loss is kept (exact score by a
+        re-search); a candidate that does not lose at all wins outright (best score).
+        Among the kept losses: the wall that lengthens the opponent's path most, then
+        the largest (opponent - own) distance (progress, no retreat), then the latest
+        loss, then the opponent's distance and the seeded order. On timeout the
+        candidates checked so far are used (the searched best move is first).
+        """
+        me = state.turn
+        m0 = self.masks(state)
+        op_now = self.dist_m(m0, state.pawns[1 - me], 1 - me)
+        assert op_now is not None
+        floor = best_score - self.delay_slack
+        choice = (best_move, best_score)
+        best_key: tuple | None = None
+        try:
+            for j, (m, child, k, p) in enumerate(cands):
+                if j == 0:
+                    v = best_score
+                else:
+                    v = -self._negamax(child, depth - 1, -floor, -(floor - 1), 1, k)
+                    if v < floor:
+                        continue  # loses much faster
+                    v = -self._negamax(child, depth - 1, -INF, -(floor - 1), 1, k)
+                d_me, d_op = self.dist(child, me), self.dist(child, 1 - me)
+                assert d_me is not None and d_op is not None
+                if is_win_score(v) and v < 0:
+                    key: tuple = (0, d_op - op_now, d_op - d_me, v, d_op, -p)
+                else:  # not lost: the best score decides
+                    key = (1, v, d_op - d_me, 0, d_op, -p)
+                if best_key is None or key > best_key:
+                    best_key, choice = key, (m, v)
+        except SearchTimeout:
+            pass
+        return choice
+
+    def _root_scores(
+        self,
+        state: GameState,
+        root: list[tuple[Move, GameState]],
+        keys: list[int],
+        max_depth: int | None,
+        time_limit: float | None,
+        top: int | None,
+    ) -> RootSearch:
+        """Iterative deepening over `root` with one shared window: alpha = the top-th
+        best exact score of the iteration so far (-INF until there are `top`), so the
+        best `top` moves get exact scores and the others upper bounds. Iteration 1 always
+        completes; an unfinished iteration is dropped. Ties keep the order of `root`."""
+        t0 = time.perf_counter()
+        n = len(root)
+        k = n if top is None else max(1, min(top, n))
+        limit_depth = MAX_DEPTH if max_depth is None else max(1, max_depth)
+        idx = list(range(n))
+        done: list[RootScore] = []
+        done_depth = 0
+        for depth in range(1, limit_depth + 1):
+            if depth >= 2 and time_limit is not None:
+                if time.perf_counter() - t0 > time_limit / 2:
+                    break
+                self._deadline = t0 + time_limit
+            scores = [-INF] * n
+            exact = [False] * n
+            best_k: list[int] = []  # exact scores of this iteration, best first, <= k
+            try:
+                for i in idx:
+                    alpha = best_k[-1] if len(best_k) >= k else -INF
+                    v = -self._negamax(root[i][1], depth - 1, -INF, -alpha, 1, keys[i])
+                    scores[i] = v
+                    if v > alpha:
+                        exact[i] = True
+                        best_k.append(v)
+                        best_k.sort(reverse=True)
+                        del best_k[k:]
+            except SearchTimeout:
+                break
+            done_depth = depth
+            idx.sort(key=lambda i: (not exact[i], -scores[i], i))
+            done = [RootScore(root[i][0], scores[i], depth, exact[i]) for i in idx]
+            if all(is_win_score(v) for v in best_k):
+                break  # proven results do not change with depth
+        self._deadline = None
+        return RootSearch(done, done_depth, self.nodes, time.perf_counter() - t0)
+
+    def search_root(
+        self,
+        state: GameState,
+        max_depth: int | None = None,
+        time_limit: float | None = None,
+        moves: list[Move] | None = None,
+        top: int | None = None,
+    ) -> RootSearch:
+        """Scores of the root moves, one shared window and TT (see _root_scores).
+
+        moves=None: the root set of search() (pawn moves + pruned walls); otherwise
+        exactly the given legal moves (any wall, e.g. a played move outside the pruned
+        set; ValueError for an illegal one). top=None: every score exact; top=k: the
+        best k exact, the others upper bounds (cheaper). Limits as in search().
+        """
+        try:
+            self._check_args(state, max_depth, time_limit)
+            self._reset(state)
+            if moves is None:
+                root = self.ordered_moves(state)
+                if not root:
+                    root = [(m, apply_move_unchecked(state, m)) for m in legal_moves(state)]
+            else:
+                legal = set(legal_moves(state))
+                for m in moves:
+                    if m not in legal:
+                        raise ValueError(f"illegal move {m!r}")
+                root = [(m, apply_move_unchecked(state, m)) for m in dict.fromkeys(moves)]
+                if not root:
+                    raise ValueError("no moves to search")
+            return self._root_scores(
+                state, root, self._keys(state, root), max_depth, time_limit, top
+            )
+        finally:
+            self._free()
+
+    def search_top(
+        self,
+        state: GameState,
+        time_limit: float | None = None,
+        top_n: int = 3,
+        alt_share: float = 0.1,
+        max_depth: int | None = None,
+    ) -> TopResult:
+        """The best move by the ordinary search, plus up to top_n - 1 alternatives.
+
+        The main search is exactly search() with the WHOLE time_limit (same moves, same
+        scores, same iteration rule: so the same depth as SearchBot at that move time;
+        phase 8, report 0061). It usually stops early (no new iteration after half the
+        budget), and the rest of time_limit, but at least alt_share of it, goes to a
+        search_root of the other root moves with top = top_n - 1, no deeper than the main
+        search and with the TT / caches the main search left: the whole call takes at
+        most about time_limit * (1 + alt_share). Alternative
+        scores are display scores, capped by the main one and by the upper bound the main
+        search proved for that move at its depth (so a move refuted there, e.g. by a
+        proven loss, is not shown better than that).
+        """
+        t0 = time.perf_counter()
+        try:
+            self._check_args(state, max_depth, time_limit)
+            self._reset(state)
+            best = self._search(state, max_depth, time_limit)
+            info = self._root_info
+            alts: list[RootScore] = []
+            alt_depth = 0
+            if top_n > 1 and info is not None:
+                root, keys, bounds, bdepth = info
+                rest = [i for i in range(len(root)) if root[i][0] != best.move]
+                if rest:
+                    left = (
+                        None
+                        if time_limit is None
+                        else max(alt_share * time_limit, time_limit - (time.perf_counter() - t0))
+                    )
+                    rs = self._root_scores(
+                        state,
+                        [root[i] for i in rest],
+                        [keys[i] for i in rest],
+                        best.depth,
+                        left,
+                        top_n - 1,
+                    )
+                    alt_depth = rs.depth
+                    bound = {root[i][0]: bounds[i] for i in rest} if bounds else {}
+                    cap = best.display_score
+                    for r in rs.scores:
+                        s = display_score(r.score, r.depth)
+                        b = bound.get(r.move)
+                        if b is not None:
+                            s = min(s, display_score(b, bdepth))
+                        alts.append(RootScore(r.move, min(s, cap), r.depth, r.exact))
+                    alts.sort(key=lambda r: (not r.exact, -r.score))
+                    del alts[top_n - 1 :]
+            return TopResult(best, alts, alt_depth, self.nodes, time.perf_counter() - t0)
+        finally:
+            self._free()
