@@ -27,3 +27,8 @@ Thumbs.db
 
 # Claude Code local settings
 .claude/settings.local.json
+training/
+.cache/
+# numba on-disk kernel cache (quoridor/__pycache__ or NUMBA_CACHE_DIR)
+*.nbi
+*.nbc
