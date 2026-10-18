@@ -1,0 +1,179 @@
+{
+  "version": 1,
+  "doc": "Набор «реальных позиций» фазы 9 (шаг 2). Позиция = префикс партии tests/fixtures/games/<game>.txt из ply полуходов; ходит side. core=true: v4 давал стороне >= +3 (в разборе партии, на 1 с или на 3 с), сторона потом проиграла, правильный план известен из комментариев; core=false: план из комментариев известен, но оценка v4 ниже +3 (ход-ошибка или топтание). checks: жёсткие критерии (позиция верна, если выполнены все); prefer: желательное, только в отчёте. Типы: eval_max, forbid_moves, forbid_kind, want_moves, want_kind, avoid_cage, no_repeat, any_of. Оценки в шагах с точки зрения side. v4_eval: справочно, оценка v4 стороне на 3 с в базовом прогоне (отчёт 0074); у позиций топтания её нет.",
+  "positions": [
+    {
+      "id": "g02-m20",
+      "game": "game02", "ply": 38, "side": "white", "played": "f2", "core": true, "v4_eval": 6.25,
+      "why": "Ход 20 белых: анализатор давал f2 при +5..+6, после 20... f2v белые проиграны. f2 не должен быть выбором бота; 5-секундный поиск в разборе предлагал f2h.",
+      "comment": "game02.txt, строки 5-6 «ходы 18-20: анализатор советует h2, g2, f2 ... после 20... f2v белые проиграны»; ROADMAP, фаза 8: «game02 ход 20: f2 не топ-1»",
+      "checks": [{"type": "forbid_moves", "moves": ["f2"]}],
+      "prefer": [{"type": "want_moves", "moves": ["f2h"]}]
+    },
+    {
+      "id": "g03-m16",
+      "game": "game03", "ply": 30, "side": "white", "played": "g2", "core": true, "v4_eval": 6.25,
+      "why": "Ход 16 белых: забор c3h e3h g3h, путь белых 9 -> 19; после 16... g3h белые проиграны при любой игре. Реальная оценка около -9, бот видит плюс. Правильный ответ: защитная стенка, а не g2.",
+      "comment": "game03.txt, строки 5-7 (ход 16 g2: оценка скачет +5.25 / -8.50; «проиграны при любой игре»); ROADMAP, бэклог: «оценка game03 ход 16 (+4,75 против реальных -9)»",
+      "checks": [{"type": "eval_max", "value": 0}],
+      "prefer": [{"type": "want_kind", "kind": "wall"}]
+    },
+    {
+      "id": "g03-m17",
+      "game": "game03", "ply": 32, "side": "white", "played": "h2h", "core": true, "v4_eval": 9.25,
+      "why": "Ход 17 белых, после 16... g3h: «белые проиграны при любой игре (мат за 36 полуходов)». Оценка в пользу белых неверна по знаку.",
+      "comment": "game03.txt, строка 7: «после 16...g3h белые проиграны при любой игре (мат за 36 полуходов); случайная 17.h2h ничего не изменила»",
+      "checks": [{"type": "eval_max", "value": 0}]
+    },
+    {
+      "id": "g03-m18",
+      "game": "game03", "ply": 34, "side": "white", "played": "h2", "core": true, "v4_eval": -6.0,
+      "why": "Ход 18 белых, та же проигранная позиция (мат за ~34 полухода).",
+      "comment": "game03.txt, строка 7 (проиграны при любой игре)",
+      "checks": [{"type": "eval_max", "value": 0}]
+    },
+    {
+      "id": "g03-shuffle-m21",
+      "game": "game03", "ply": 40, "side": "white", "played": "h3", "core": false, "v4_eval": null,
+      "why": "Ходы 21-33: белые ходят туда-обратно, бот в проигранной позиции не ищет лучший шанс. На 8 своих ходах позиции (клетка, запас стенок) не должны повторяться.",
+      "comment": "game03.txt, строка 8: «ходы 21-33: белые ходят туда-обратно — бот в проигранной позиции не ищет лучший шанс»",
+      "checks": [{"type": "no_repeat", "own_moves": 8, "max_repeats": 0}]
+    },
+    {
+      "id": "g04-m11",
+      "game": "game04", "ply": 21, "side": "black", "played": "g4", "core": true, "v4_eval": 3.7,
+      "why": "Ход 11 чёрных: +3.2, сыграно g4 (??) вместо f3v. Оценка верна, ход g4 (возврат туда-обратно g4 g5 g4) запрещён, нужна стенка f3v.",
+      "comment": "game04.txt, строки 2-3: «чёрные были +3.2 на ходу 11..., сыграно g4 вместо f3v (??); ходы 9...-11... — фишка туда-обратно g4 g5 g4»",
+      "checks": [{"type": "forbid_moves", "moves": ["g4"]}],
+      "prefer": [{"type": "want_moves", "moves": ["f3v"]}]
+    },
+    {
+      "id": "g05-m7",
+      "game": "game05", "ply": 13, "side": "black", "played": "b8h", "core": false, "v4_eval": -0.3,
+      "why": "7... b8h (??): v4 советует c7v, после ошибки оценка -0.8 -> -5.0.",
+      "comment": "game05.txt, строка 2: «7... b8h ?? (v4: c7v, -0.8 -> -5.0)»",
+      "checks": [{"type": "forbid_moves", "moves": ["b8h"]}],
+      "prefer": [{"type": "want_moves", "moves": ["c7v"]}]
+    },
+    {
+      "id": "g05-m11",
+      "game": "game05", "ply": 21, "side": "black", "played": "h9h", "core": false, "v4_eval": -0.5,
+      "why": "11... h9h (??): v4 советует g7v, после ошибки оценка -1.1 -> -6.0; после 14. h5v путь чёрных 17 против 7.",
+      "comment": "game05.txt, строка 2: «11... h9h ?? (v4: g7v, -1.1 -> -6.0)»",
+      "checks": [{"type": "forbid_moves", "moves": ["h9h"]}],
+      "prefer": [{"type": "want_moves", "moves": ["g7v"]}]
+    },
+    {
+      "id": "g06-p33",
+      "game": "game06", "ply": 33, "side": "black", "played": "f5", "core": false, "v4_eval": 2.05,
+      "why": "Чёрные выигрывают (путь 3-5 против 15-20), но тратят все стенки, а у белых остаются все 10. Нужно идти фишкой, не тратить последние стенки.",
+      "comment": "game06.txt, строки 3-5: «на ходах 14...-20... чёрные выигрывают ... НО тратят ВСЕ 10 стенок (17... b5h и 20... b6v)»; ROADMAP, фаза 8: «game06 17...-20...: бот не тратит последние стенки»",
+      "checks": [{"type": "forbid_kind", "kind": "wall"}]
+    },
+    {
+      "id": "g06-p35",
+      "game": "game06", "ply": 35, "side": "black", "played": "b5h", "core": false, "v4_eval": 2.05,
+      "why": "Сыграно b5h (предлагал сам v4). Последние стенки тратить нельзя, нужен ход фишкой.",
+      "comment": "game06.txt, строки 3-5 (b5h)",
+      "checks": [{"type": "forbid_kind", "kind": "wall"}]
+    },
+    {
+      "id": "g06-p37",
+      "game": "game06", "ply": 37, "side": "black", "played": "f4", "core": false, "v4_eval": 1.65,
+      "why": "У чёрных не больше 2 стенок против 10: нужен ход фишкой.",
+      "comment": "game06.txt, строки 3-5",
+      "checks": [{"type": "forbid_kind", "kind": "wall"}]
+    },
+    {
+      "id": "g06-p39",
+      "game": "game06", "ply": 39, "side": "black", "played": "b6v", "core": false, "v4_eval": 1.75,
+      "why": "Сыграно b6v (последняя стенка). Нужен ход фишкой.",
+      "comment": "game06.txt, строки 3-5 (b6v)",
+      "checks": [{"type": "forbid_kind", "kind": "wall"}]
+    },
+    {
+      "id": "g07-m24",
+      "game": "game07", "ply": 46, "side": "white", "played": "e9v", "core": true, "v4_eval": 6.05,
+      "why": "Ход 24: v4 +5..+7 (путь белых 4, чёрных 17..21), но у чёрных 7 стенок против 2 и они строят клетку c8h b7v e6h g8h h7v (путь белых 3 -> 10). Верно: оценка белых не выше 0 ИЛИ ход не ведёт в клетку.",
+      "comment": "game07.txt, строки 2-4 (ход 24 +5..+7, клетка c8h b7v e6h g8h h7v); ROADMAP, фаза 9, критерий готовности: «game07 ходы 24-30: оценка белых не выше 0 или ход не ведёт в клетку»",
+      "checks": [{"type": "any_of", "checks": [
+        {"type": "eval_max", "value": 0},
+        {"type": "avoid_cage", "walls": ["c8h", "b7v", "e6h", "g8h", "h7v"], "min_dist": 8}
+      ]}]
+    },
+    {
+      "id": "g07-m25",
+      "game": "game07", "ply": 48, "side": "white", "played": "c7", "core": true, "v4_eval": 4.95,
+      "why": "Ход 25 (см. g07-m24).",
+      "comment": "game07.txt, строки 2-4; ROADMAP, фаза 9",
+      "checks": [{"type": "any_of", "checks": [
+        {"type": "eval_max", "value": 0},
+        {"type": "avoid_cage", "walls": ["c8h", "b7v", "e6h", "g8h", "h7v"], "min_dist": 8}
+      ]}]
+    },
+    {
+      "id": "g07-m26",
+      "game": "game07", "ply": 50, "side": "white", "played": "d7", "core": true, "v4_eval": 4.55,
+      "why": "Ход 26 (см. g07-m24).",
+      "comment": "game07.txt, строки 2-4; ROADMAP, фаза 9",
+      "checks": [{"type": "any_of", "checks": [
+        {"type": "eval_max", "value": 0},
+        {"type": "avoid_cage", "walls": ["c8h", "b7v", "e6h", "g8h", "h7v"], "min_dist": 8}
+      ]}]
+    },
+    {
+      "id": "g07-m27",
+      "game": "game07", "ply": 52, "side": "white", "played": "d3h", "core": true, "v4_eval": 3.75,
+      "why": "Ход 27 (см. g07-m24).",
+      "comment": "game07.txt, строки 2-4; ROADMAP, фаза 9",
+      "checks": [{"type": "any_of", "checks": [
+        {"type": "eval_max", "value": 0},
+        {"type": "avoid_cage", "walls": ["c8h", "b7v", "e6h", "g8h", "h7v"], "min_dist": 8}
+      ]}]
+    },
+    {
+      "id": "g07-m28",
+      "game": "game07", "ply": 54, "side": "white", "played": "e7", "core": true, "v4_eval": 2.85,
+      "why": "Ход 28 (см. g07-m24).",
+      "comment": "game07.txt, строки 2-4; ROADMAP, фаза 9",
+      "checks": [{"type": "any_of", "checks": [
+        {"type": "eval_max", "value": 0},
+        {"type": "avoid_cage", "walls": ["c8h", "b7v", "e6h", "g8h", "h7v"], "min_dist": 8}
+      ]}]
+    },
+    {
+      "id": "g07-m29",
+      "game": "game07", "ply": 56, "side": "white", "played": "f7", "core": false, "v4_eval": 2.85,
+      "why": "Ход 29 (см. g07-m24); после 29... e6h клетка почти замкнута.",
+      "comment": "game07.txt, строки 2-4; ROADMAP, фаза 9",
+      "checks": [{"type": "any_of", "checks": [
+        {"type": "eval_max", "value": 0},
+        {"type": "avoid_cage", "walls": ["c8h", "b7v", "e6h", "g8h", "h7v"], "min_dist": 8}
+      ]}]
+    },
+    {
+      "id": "g07-m30",
+      "game": "game07", "ply": 58, "side": "white", "played": "e7", "core": false, "v4_eval": 1.75,
+      "why": "Ход 30 (см. g07-m24).",
+      "comment": "game07.txt, строки 2-4; ROADMAP, фаза 9",
+      "checks": [{"type": "any_of", "checks": [
+        {"type": "eval_max", "value": 0},
+        {"type": "avoid_cage", "walls": ["c8h", "b7v", "e6h", "g8h", "h7v"], "min_dist": 8}
+      ]}]
+    },
+    {
+      "id": "g07-shuffle-m30",
+      "game": "game07", "ply": 58, "side": "white", "played": "e7", "core": false, "v4_eval": null,
+      "why": "Ходы 30-44: белые 15 ходов топчутся d6/e6/d5/e5, чёрные проходят 19 -> 5. На 8 своих ходах (ходы 30-37) позиции (клетка, запас стенок) не должны повторяться.",
+      "comment": "game07.txt, строка 4: «Ходы 30-44: белые 15 ходов топчутся d6/e6/d5/e5, чёрные проходят 19 -> 5 ... при 30 с те же ходы»",
+      "checks": [{"type": "no_repeat", "own_moves": 8, "max_repeats": 0}]
+    },
+    {
+      "id": "g07-shuffle-m38",
+      "game": "game07", "ply": 74, "side": "white", "played": "e5", "core": false, "v4_eval": null,
+      "why": "Продолжение топтания (ходы 38-44): 7 своих ходов без повторов (клетка, запас стенок).",
+      "comment": "game07.txt, строка 4 (ходы 30-44)",
+      "checks": [{"type": "no_repeat", "own_moves": 7, "max_repeats": 0}]
+    }
+  ]
+}
