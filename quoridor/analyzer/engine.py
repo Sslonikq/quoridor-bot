@@ -143,6 +143,7 @@ def rank_moves(
     state: GameState,
     budget: float,
     cancelled: Callable[[], bool] = lambda: False,
+    on_depth: Callable[[int], None] | None = None,
 ) -> tuple[list[RankedMove], int]:
     """Top moves of v4. Returns (moves best first, depth of the best move from the root).
 
@@ -162,6 +163,7 @@ def rank_moves(
     if wins:
         return [RankedMove(m, WIN - 1) for m in wins[:TOP_N]], 1
     searcher = _CancellableSearcher(cancelled)
+    searcher.on_depth = on_depth  # live depth of the main search (completed iterations)
     try:
         res = searcher.search_top(state, budget, TOP_N, ALT_SHARE)
     except _Cancelled:
@@ -272,6 +274,7 @@ def analyze(
     moves: object,
     seconds: float = DEFAULT_TIME,
     cancelled: Callable[[], bool] = lambda: False,
+    on_depth: Callable[[int], None] | None = None,
 ) -> dict:
     """Top-3 moves with scores and reasons, plus the position evaluation (white's view).
 
@@ -279,7 +282,7 @@ def analyze(
     win/loss, set by the server so that the client knows no score constants), why, depth
     (plies of that entry's search) and exact (False: an upper bound). The top-level
     `depth` is the depth of the best move's search, counted from the analysed position
-    (see rank_moves).
+    (see rank_moves). `on_depth(d)` is called after every completed iteration (live depth).
     """
     state = replay(moves)
     pos = describe(state, moves)
@@ -294,7 +297,7 @@ def analyze(
         }
     seconds = _clamp_time(seconds)
     t0 = time.perf_counter()
-    ranked, depth = rank_moves(state, seconds, cancelled)
+    ranked, depth = rank_moves(state, seconds, cancelled, on_depth)
     if cancelled() or not ranked:
         return {
             "position": pos,

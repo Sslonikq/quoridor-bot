@@ -24,7 +24,11 @@
         <button id="bUndo" title="Отменить ход (Backspace)">↶<span class="lbl"> Отменить</span><kbd>⌫</kbd></button>
         <button id="bFlip" title="Перевернуть доску (F)">⇅<span class="lbl"> Перевернуть</span><kbd>F</kbd></button>
         <button id="bHint" class="on" title="Подсказка (H)">💡<span class="lbl" id="hintLbl"> Подсказка: вкл</span><kbd>H</kbd></button>
-        <button id="bDeep" title="Глубокий анализ текущей позиции, 20 с (Esc отменяет)">🔍<span class="lbl" id="deepLbl"> Глубокий анализ</span><kbd>20 с</kbd></button>
+        <span class="seg" role="group" aria-label="Время подсказки">
+          <button id="mode_fast" title="Быстро: 1 с на позицию">Быстро<kbd>1 с</kbd></button>
+          <button id="mode_normal" title="Нормально: 5 с на позицию">Нормально<kbd>5 с</kbd></button>
+          <button id="mode_deep" title="Глубоко: 20 с на позицию (Esc отменяет)">Глубоко<kbd>20 с</kbd></button>
+        </span>
       </div>
       <div class="boardrow">
         <div class="evalbar" id="evalbar" aria-label="Шкала оценки"><div class="w" id="evalW"></div><div class="num" id="evalNum"></div></div>

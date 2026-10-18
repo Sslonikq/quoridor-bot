@@ -1,7 +1,16 @@
 "use strict";
 // Только отрисовка и ввод. Правила, легальность ходов и оценки приходят с сервера:
 // клиент держит список ходов в нотации сайта и просит сервер проиграть его с начала.
-const N = 9, COLS = "abcdefghi", ANALYZE_SECONDS = 5, DEEP_SECONDS = 20;
+const N = 9, COLS = "abcdefghi";
+// Режимы времени подсказки: быстро / нормально / глубоко. Выбор запоминается в localStorage.
+const MODES = { fast: { sec: 1, name: "Быстро" }, normal: { sec: 5, name: "Нормально" }, deep: { sec: 20, name: "Глубоко" } };
+const MODE_KEY = "quoridor.analyzer.mode";
+function loadMode() {
+  try { const m = localStorage.getItem(MODE_KEY); if (m && Object.prototype.hasOwnProperty.call(MODES, m)) return m; } catch (_) { /* хранилище недоступно */ }
+  return "normal";
+}
+function saveMode(m) { try { localStorage.setItem(MODE_KEY, m); } catch (_) { /* не критично */ } }
+let mode = loadMode();
 const $ = id => document.getElementById(id);
 const svg = $("board"), NS = "http://www.w3.org/2000/svg";
 
@@ -18,7 +27,7 @@ let lastMate = false;     // оценка доказанный выигрыш (�
 let lastEval = null;      // последняя известная оценка (для шкалы, пока считается новая)
 let flipped = false, hintOn = true, hover = null;
 let seq = 0, aseq = 0, abortCtl = null;  // seq: запросы /api/state, aseq: запросы /api/analyze
-let deep = null;          // «Глубокий анализ» в работе: {t0, timer}; null, когда не идёт
+let live = null;          // расчёт подсказки в работе: {t0, sec, depth, timer}; null, когда не идёт
 let okLine = [], okPly = 0;  // последний подтверждённый сервером список ходов и позиция
 
 // ---------- Геометрия (только отрисовка; имена ходов и геометрию присылает сервер) ----------
@@ -128,7 +137,7 @@ function stopAnalysis(cancel) {
   aseq++;
   if (abortCtl) abortCtl.abort();
   abortCtl = null; ana = null; anaState = "idle";
-  clearDeep();
+  clearLive();
   if (cancel) api("/api/cancel", {}).catch(() => {});
 }
 // Подсказка для текущей позиции: из разбора, если он её уже посчитал; пока идёт разбор, не мешаем ему.
@@ -136,7 +145,7 @@ function showHint() {
   if (!pos || pos.winner !== null) return;
   if (applyReviewHint()) { api("/api/cancel", {}).catch(() => {}); return; }
   if (reviewRunning()) { api("/api/cancel", {}).catch(() => {}); anaState = "review"; render(); return; }
-  analyze();
+  startAnalysis();
 }
 function applyReviewHint() {
   const st = reviewStep(ply);
@@ -148,49 +157,71 @@ function applyReviewHint() {
   render();
   return true;
 }
-async function analyze(seconds = ANALYZE_SECONDS, isDeep = false) {
+async function analyze(seconds = MODES[mode].sec, modeName = mode, retry = true) {
   const my = ++aseq;
   anaState = "busy"; renderEval(); renderBest();
   abortCtl = new AbortController();
   try {
     const res = await api("/api/analyze", { moves: line.slice(0, ply), time: seconds }, abortCtl.signal);
-    if (my !== aseq || res.cancelled) return;
-    clearDeep();
+    if (my !== aseq) return;
+    if (res.cancelled) {
+      // Запрос актуален, но сервер его отменил: чужой /api/cancel (отправленный раньше, дошёл позже)
+      // убил этот расчёт. Один раз повторяем, иначе не оставляем интерфейс в «Считаю…».
+      if (retry) return analyze(seconds, modeName, false);
+      clearLive(); anaState = "idle"; render(); return;
+    }
+    clearLive();
     if (!res.ok) { anaState = "idle"; toast(res.error); render(); return; }
     ana = res; anaState = "done"; lastEval = res.eval; lastMate = res.eval_mate;
-    if (isDeep) ana.deep = seconds;
+    ana.mode = modeName; ana.secs = seconds;
     render();
-  } catch (e) { if (e.name !== "AbortError" && my === aseq) { clearDeep(); anaState = "idle"; toast("Анализ не удался"); render(); } }
+  } catch (e) { if (e.name !== "AbortError" && my === aseq) { clearLive(); anaState = "idle"; toast("Анализ не удался"); render(); } }
 }
-// ---------- Глубокий анализ ----------
-// Тот же /api/analyze, но time=20 и по явной кнопке. Живой глубины сервер по ходу поиска не отдаёт,
-// поэтому показываем прошедшее время; глубина и «глубокий, 20 с» появляются в результате.
-function clearDeep() { if (deep) { clearInterval(deep.timer); deep = null; renderDeep(); } }
-function deepElapsed() { return deep ? Math.min(DEEP_SECONDS, (Date.now() - deep.t0) / 1000) : 0; }
-function renderDeep() {
-  const prog = $("deepProg"), btn = $("bDeep");
-  prog.hidden = !deep;
-  if (deep) { prog.max = DEEP_SECONDS; prog.value = deepElapsed(); }
-  btn.classList.toggle("busy", !!deep);
-  $("deepLbl").textContent = deep ? " Отменить" : " Глубокий анализ";
-  if (deep) $("anaMsg").textContent = `Глубокий анализ: ${deepElapsed().toFixed(0)} из ${DEEP_SECONDS} с. Esc отменяет.`;
+// ---------- Расчёт подсказки: прогресс и живая глубина (все режимы) ----------
+// Живую глубину (завершённые итерации поиска) отдаёт /api/progress; опрашиваем его по таймеру, пока идёт расчёт.
+function clearLive() { if (live) { clearInterval(live.timer); live = null; renderLive(); } }
+async function pollLive(d) {
+  if (d.polling) return;
+  d.polling = true;
+  try {
+    const r = await api("/api/progress", {});
+    if (live === d && r.ok) { d.depth = r.depth; renderLive(); }
+  } catch (_) { /* связь пропала: покажем время без глубины */ }
+  d.polling = false;
 }
-function startDeep() {
-  if (deep) { cancelDeep(); return; }
-  if (!pos || pos.winner !== null) { toast("Ходов нет: партия окончена"); return; }
-  if (!hintOn) { toast("Включите подсказку (H)"); return; }
-  if (reviewRunning()) { toast("Идёт разбор партии"); return; }
-  stopAnalysis(true);  // прежний расчёт (на клиенте и на сервере) больше не нужен
-  deep = { t0: Date.now(), timer: setInterval(renderDeep, 250) };
-  renderDeep();
-  analyze(DEEP_SECONDS, true);
+function liveElapsed() { return live ? Math.min(live.sec, (Date.now() - live.t0) / 1000) : 0; }
+function renderLive() {
+  const prog = $("deepProg");
+  prog.hidden = !live;
+  if (live) { prog.max = live.sec; prog.value = liveElapsed(); }
+  for (const k in MODES) { const b = $("mode_" + k); b.classList.toggle("on", k === mode); b.setAttribute("aria-pressed", k === mode ? "true" : "false"); }
+  if (live) $("anaMsg").textContent = `${MODES[mode].name}: ${liveElapsed().toFixed(0)} из ${live.sec} с${live.depth ? `, глубина ${live.depth}` : ""}. Esc отменяет.`;
 }
-// Отмена: прекращаем поиск и возвращаем обычную подсказку для этой позиции.
-function cancelDeep() {
-  if (!deep) return;
+// Запуск расчёта подсказки в текущем режиме. Без /api/cancel: новый /api/analyze сам отменяет старый на сервере,
+// а отдельный cancel мог бы дойти позже и убить новый.
+function startAnalysis() {
+  clearLive();
+  const sec = MODES[mode].sec;
+  const d = live = { t0: Date.now(), sec, depth: 0, polling: false, timer: null };
+  d.timer = setInterval(() => { renderLive(); pollLive(d); }, 500);
+  renderLive();
+  analyze(sec, mode);
+}
+// Esc: прекращаем поиск (и на сервере); новый расчёт запускается сменой хода/режима или кликом по режиму.
+function cancelAnalysis() {
+  if (!live) return;
   stopAnalysis(true);
   render();
-  if (hintOn) showHint();
+  $("anaMsg").textContent = "Расчёт отменён. Клик по режиму пересчитает позицию.";
+}
+function setMode(m) {
+  if (!Object.prototype.hasOwnProperty.call(MODES, m)) return;
+  if (m === mode && live) { cancelAnalysis(); return; }  // повторный клик по busy-режиму отменяет расчёт
+  mode = m; saveMode(m);
+  renderLive();
+  if (!pos || pos.winner !== null || !hintOn || reviewRunning()) return;
+  stopAnalysis(false);
+  startAnalysis();
 }
 // Отрезает хвост списка (ветка): исходная партия запоминается для «Вернуть партию».
 function cut(n) {
@@ -359,10 +390,10 @@ function renderBest() {
   const best = $("best"), msg = $("anaMsg");
   if (!hintOn) { best.innerHTML = `<div class="hidden-hint">Подсказка скрыта. Нажмите <kbd>H</kbd>, когда подумаете сами.</div>`; msg.textContent = ""; return; }
   if (pos && pos.winner !== null) { best.innerHTML = `<div class="hidden-hint">Ходов нет: партия окончена.</div>`; msg.textContent = ""; return; }
-  if (!ana) { best.innerHTML = `<div class="hidden-hint">${anaState === "busy" ? (deep ? "Глубокий анализ…" : "Считаю…") : anaState === "review" ? "Идёт разбор партии, подсказка появится для разобранных позиций." : ""}</div>`; msg.textContent = ""; return; }
+  if (!ana) { best.innerHTML = `<div class="hidden-hint">${anaState === "busy" ? "Считаю…" : anaState === "review" ? "Идёт разбор партии, подсказка появится для разобранных позиций." : ""}</div>`; msg.textContent = ""; return; }
   best.innerHTML = ana.top.map((x, i) => `<div class="bm${i ? "" : " top"}" data-i="${i}" tabindex="0" role="button"><span class="rk">${i + 1}</span><span class="mv">${x.name}</span><span class="why" title="${x.why} · глубина ${x.depth}">${x.why} · гл. ${x.depth}</span><span class="ev">${x.exact || x.mate ? "" : "≤ "}${fmtE(x.score, x.mate)}</span></div>`).join("");
   best.querySelectorAll(".bm").forEach(d => { const go = () => play(ana.top[+d.dataset.i]); d.onclick = go; d.onkeydown = ev => { if (ev.key === "Enter") go(); }; });
-  msg.textContent = `${ana.deep ? `Глубокий, ${ana.deep} с: г` : ana.review ? "Из разбора: г" : "Г"}лубина ${ana.depth}, ${ana.elapsed.toFixed(1)} с. Оценка в шагах, плюс — белым; «≤» — оценка не лучше указанной.`;
+  msg.textContent = `${ana.review ? "Из разбора: г" : ana.mode ? `${MODES[ana.mode].name}, ${ana.secs} с: г` : "Г"}лубина ${ana.depth}, ${ana.elapsed.toFixed(1)} с. Оценка в шагах, плюс — белым; «≤» — оценка не лучше указанной.`;
 }
 function renderMoves() {
   const k = commonLen();
@@ -384,7 +415,7 @@ function renderMoves() {
   $("bRestore").hidden = !mainLine;
 }
 function render() {
-  drawBoard(); renderEval(); renderBest(); renderMoves(); renderSummary(); renderReviewUi(); drawGraph(); renderMoveInfo(); renderDeep();
+  drawBoard(); renderEval(); renderBest(); renderMoves(); renderSummary(); renderReviewUi(); drawGraph(); renderMoveInfo(); renderLive();
   if (!pos) return;
   const [dW, dB] = pos.dist, bar = n => "▮".repeat(n) + "<i>" + "▯".repeat(10 - n) + "</i>";
   $("status").innerHTML =
@@ -411,7 +442,7 @@ $("bHint").onclick = () => {
   if (hintOn) refresh();
   else { stopAnalysis(true); render(); }
 };
-$("bDeep").onclick = startDeep;
+for (const k in MODES) $("mode_" + k).onclick = () => setMode(k);
 $("bNew").onclick = () => {
   if (rv) { if (reviewRunning()) api("/api/review/cancel", {}).catch(() => {}); rv = null; }
   line = []; ply = 0; mainLine = null; fromLoad = false; lastEval = null; $("loadMsg").textContent = ""; refresh();
@@ -435,7 +466,7 @@ $("bLoad").onclick = async () => {
 $("bReview").onclick = () => { if (reviewRunning()) stopReview(); else startReview(); };
 document.addEventListener("keydown", e => {
   if (e.ctrlKey || e.metaKey || e.altKey) return;
-  if (e.key === "Escape" && deep) { cancelDeep(); e.preventDefault(); return; }
+  if (e.key === "Escape" && live) { cancelAnalysis(); e.preventDefault(); return; }
   if (e.target.tagName === "TEXTAREA" || e.target.tagName === "INPUT") return;
   const k = e.key;
   if (k === "ArrowLeft") { $("bPrev").click(); e.preventDefault(); }

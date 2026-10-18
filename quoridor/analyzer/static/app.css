@@ -87,3 +87,4 @@ input:focus-visible{outline:2px solid var(--hint);outline-offset:2px}
 .graph-card .graph{border-radius:6px}
 button.busy{border-color:var(--hint);color:var(--hint)}
 #deepProg{margin-top:6px}
+.seg{display:inline-flex;gap:0}.seg button{border-radius:0;margin-left:-1px}.seg button:first-child{border-radius:6px 0 0 6px;margin-left:0}.seg button:last-child{border-radius:0 6px 6px 0}

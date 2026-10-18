@@ -5,6 +5,8 @@
                      ("time" is optional: engine.DEFAULT_TIME)
   POST /api/evaluate {"moves": [...], "move": "e3h", "time": 3.0}
                      -> score of that one move in the position after "moves" (engine.evaluate_move)
+  POST /api/progress {}                            -> {"busy", "depth"}: live depth (completed
+                     iterations) of the running analysis; depth 0 before the first one
   POST /api/cancel   {}                            -> cancels the running analysis / evaluation
   POST /api/parse    {"text": "d1 e8 ..."}         -> {"moves": [...]}: a pasted game (see
                      engine.parse_game_text), replayed and validated
@@ -47,6 +49,7 @@ ROUTES = (
     "/api/analyze",
     "/api/evaluate",
     "/api/cancel",
+    "/api/progress",
     "/api/parse",
     "/api/review",
     "/api/review/status",
@@ -112,6 +115,7 @@ class AnalyzerServer(ThreadingHTTPServer):
         super().__init__((HOST, port), Handler)
         self._job_lock = threading.Lock()
         self._job: threading.Event | None = None
+        self._depth = 0  # live depth of the current analysis (see on_depth)
         self._review: ReviewJob | None = None
         self._review_seq = 0
 
@@ -126,7 +130,18 @@ class AnalyzerServer(ThreadingHTTPServer):
             if self._job is not None:
                 self._job.set()
             self._job = ev
+            self._depth = 0
         return ev
+
+    def on_depth(self, ev: threading.Event, depth: int) -> None:
+        """Progress of the analysis `ev`; ignored once a newer one has replaced it."""
+        with self._job_lock:
+            if self._job is ev:
+                self._depth = depth
+
+    def progress(self) -> dict:
+        with self._job_lock:
+            return {"busy": self._job is not None, "depth": self._depth}
 
     def start_review(self, moves: list[str], seconds: float) -> ReviewJob:
         """Start a review; the previous review and the running analysis are cancelled."""
@@ -270,6 +285,8 @@ class Handler(BaseHTTPRequestHandler):
         if route == "/api/cancel":
             self.server.cancel_job()
             return self._json(200, {"ok": True})
+        if route == "/api/progress":
+            return self._json(200, {"ok": True, **self.server.progress()})
         if route == "/api/review/cancel":
             self.server.cancel_review()
             return self._json(200, {"ok": True})
@@ -311,7 +328,12 @@ class Handler(BaseHTTPRequestHandler):
                 res = engine.evaluate_move(moves, move, float(seconds), cancel.is_set)
                 return self._json(200, {"ok": True, **res})
             cancel = self.server.start_job()
-            res = engine.analyze(moves, float(seconds), cancel.is_set)
+            res = engine.analyze(
+                moves,
+                float(seconds),
+                cancel.is_set,
+                lambda d: self.server.on_depth(cancel, d),
+            )
             if res["cancelled"]:
                 return self._json(200, {"ok": True, "cancelled": True})
             return self._json(200, {"ok": True, **res})

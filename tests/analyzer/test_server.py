@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from quoridor.analyzer.engine import ALT_SHARE, DEFAULT_TIME
 from quoridor.analyzer.server import HOST, AnalyzerServer
 
 
@@ -209,7 +210,10 @@ def test_hint_at_the_default_time_reports_depth(server):
     status, res = post(server, "/api/analyze", {"moves": ["e2", "e8"]})
     elapsed = time.perf_counter() - t0
     assert status == 200 and len(res["top"]) == 3 and res["depth"] >= 6
-    assert elapsed <= 5.5, elapsed
+    # search_top's bound: about time_limit * (1 + ALT_SHARE) = 5.5 s when the main search
+    # runs into its deadline, plus freeing the caches and the HTTP round trip (report
+    # 0077: 5.55 s seen in both modes; with numba the deadline is hit more often)
+    assert elapsed <= DEFAULT_TIME * (1 + ALT_SHARE) + 0.3, elapsed
 
 
 GAME01 = [
@@ -291,7 +295,7 @@ def test_explicit_time_up_to_30_is_accepted(server, monkeypatch):
 
     seen = []
 
-    def fake(moves, seconds, cancelled):
+    def fake(moves, seconds, cancelled, on_depth=None):
         seen.append(seconds)
         return {"cancelled": True}
 
@@ -300,6 +304,22 @@ def test_explicit_time_up_to_30_is_accepted(server, monkeypatch):
         assert post(server, "/api/analyze", {"moves": [], "time": t})[0] == 200
     assert seen == [20.0, 30.0, 0.5]
     assert engine.DEFAULT_TIME == 5.0 and engine.DEEP_TIME == 20.0
+
+
+def test_mode_times_fast_normal_deep_are_accepted_as_is(server, monkeypatch):
+    """The client's modes send 1 / 5 / 20 s; every one reaches the engine unchanged."""
+    from quoridor.analyzer import engine
+
+    seen = []
+
+    def fake(moves, seconds, cancelled, on_depth=None):
+        seen.append(seconds)
+        return {"cancelled": True}
+
+    monkeypatch.setattr(engine, "analyze", fake)
+    for t in (1, 5, 20):
+        assert post(server, "/api/analyze", {"moves": [], "time": t})[0] == 200
+    assert seen == [1.0, 5.0, 20.0]
 
 
 @pytest.mark.parametrize(
@@ -451,3 +471,34 @@ def test_rejected_evaluate_does_not_cancel_the_running_analysis(server):
     assert post(server, "/api/evaluate", {"moves": [], "move": "e5"})[0] == 400
     t.join(10)
     assert out["a"][0] == 200 and not out["a"][1].get("cancelled")
+
+
+def test_progress_reports_live_depth_of_the_running_analysis(server):
+    assert post(server, "/api/progress", {}) == (200, {"ok": True, "busy": False, "depth": 0})
+    out = {}
+    t = threading.Thread(
+        target=lambda: out.update(a=post(server, "/api/analyze", {"moves": [], "time": 4}))
+    )
+    t.start()
+    depth = 0
+    for _ in range(40):
+        time.sleep(0.1)
+        status, res = post(server, "/api/progress", {})
+        assert status == 200 and res["ok"]
+        depth = res["depth"]
+        if depth >= 2:
+            break
+    assert depth >= 2
+    post(server, "/api/cancel", {})
+    t.join(10)
+    assert out["a"][1].get("cancelled") is True
+    assert post(server, "/api/progress", {})[1]["busy"] is False
+
+
+def test_stale_job_does_not_overwrite_progress(server):
+    old = server.start_job()
+    new = server.start_job()
+    server.on_depth(old, 9)
+    assert server.progress()["depth"] == 0
+    server.on_depth(new, 3)
+    assert server.progress()["depth"] == 3
