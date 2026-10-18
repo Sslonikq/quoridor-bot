@@ -11,11 +11,20 @@ import time
 from collections.abc import Callable, Mapping
 from typing import Protocol
 
-from quoridor.eval import RESERVE_V4, THREAT_V4, WALL, WALL_V3
+from quoridor.eval import PLAN_V4, RESERVE_V4, SOFT_V4, THREAT_V4, WALL, WALL_V3
 from quoridor.frozen import search_v1, search_v4
+from quoridor.mcts import MCTSBot
 from quoridor.paths import shortest_path, shortest_path_length
 from quoridor.rules import apply_move_unchecked, is_wall_legal, legal_moves, pawn_moves
-from quoridor.search import DEFAULT_WALL_LIMIT, V2_TT_BITS, Searcher, SearchResult
+from quoridor.search import (
+    COMBO_BEAM,
+    COMBO_COST,
+    COMBO_K,
+    DEFAULT_WALL_LIMIT,
+    V2_TT_BITS,
+    Searcher,
+    SearchResult,
+)
 from quoridor.state import (
     WALL_GRID,
     Cell,
@@ -137,6 +146,24 @@ class GreedyBot:
         return self._rng.choice(best_pawn)
 
 
+# Searcher options of v5 (phase 9) with their "off" defaults; SearchBot passes them through.
+V5_OPTIONS: dict[str, int] = {
+    "combo": 0,
+    "combo_k": COMBO_K,
+    "combo_beam": COMBO_BEAM,
+    "combo_cost": COMBO_COST,
+    "combo_root": 0,
+    "combo_stock": 0,
+    "combo_exact": 0,
+    "combo_narrow": 0,
+    "rep": 0,
+    "rep_penalty": 0,
+    "progress": 0,
+    "race_plan": PLAN_V4,
+    "race_soft": SOFT_V4,
+}
+
+
 class SearcherLike(Protocol):
     def search(
         self, state: GameState, max_depth: int | None = None, time_limit: float | None = None
@@ -172,7 +199,11 @@ class SearchBot:
         threat: int = 0,
         root_defense: int = 0,
         reserve: int = 0,
+        **v5: int,
     ) -> None:
+        unknown = set(v5) - set(V5_OPTIONS)
+        if unknown:
+            raise TypeError(f"SearchBot: unknown options {', '.join(sorted(unknown))}")
         if depth is None and move_time is None and game_time is None:
             raise ValueError("SearchBot needs depth, move_time or game_time")
         self.depth = depth
@@ -196,6 +227,7 @@ class SearchBot:
                     ("threat", threat, 0),
                     ("root_defense", root_defense, 0),
                     ("reserve", reserve, 0),
+                    *((k, val, V5_OPTIONS[k]) for k, val in v5.items()),
                 )
                 if val != default
             ]
@@ -217,6 +249,7 @@ class SearchBot:
                 threat=threat,
                 root_defense=root_defense,
                 reserve=reserve,
+                **v5,
             )
             if searcher is None
             else searcher
@@ -224,6 +257,27 @@ class SearchBot:
         self.used = 0.0  # seconds spent in choose_move this game
         self.moves = 0
         self.last: SearchResult | None = None
+        # Positions of the current game before the one to move in (v5: repetitions). The
+        # bot records what it sees and its own moves, so in a game played move by move
+        # (arena, cli) the history is complete; set_history() gives a game prefix.
+        self._history: list[GameState] = []
+        self._after: GameState | None = None  # the position after our last move
+
+    def set_history(self, states: list[GameState]) -> None:
+        """The game's positions before the next one the bot is asked about (oldest first)."""
+        self._history = list(states)
+        self._after = None
+
+    def _track(self, state: GameState) -> None:
+        """Extend the history with `state`, or start a new one if it does not follow
+        from our last move by one opponent move (a new game or an edited position)."""
+        after = self._after
+        if after is not None:
+            if _follows(after, state):
+                self._history.append(after)
+            else:
+                self._history = []
+        self._after = None
 
     def _time_limit(self) -> float | None:
         limit = self.move_time
@@ -234,11 +288,39 @@ class SearchBot:
 
     def choose_move(self, state: GameState) -> Move:
         t0 = time.perf_counter()
+        self._track(state)
+        set_history = getattr(self._searcher, "set_history", None)
+        if set_history is not None:
+            set_history(self._history)
         res = self._searcher.search(state, self.depth, self._time_limit())
         self.used += time.perf_counter() - t0
         self.moves += 1
         self.last = res
+        self._history.append(state)
+        self._after = apply_move_unchecked(state, res.move)
         return res.move
+
+
+def _follows(before: GameState, state: GameState) -> bool:
+    """True if `state` is `before` after one move of its side to move."""
+    p = before.turn
+    if state.turn == p or state.pawns[1 - p] != before.pawns[1 - p]:
+        return False
+    if state.walls_left[1 - p] != before.walls_left[1 - p]:
+        return False
+    if state.pawns[p] != before.pawns[p]:  # a pawn move: walls unchanged
+        return (
+            state.h_walls == before.h_walls
+            and state.v_walls == before.v_walls
+            and state.walls_left == before.walls_left
+        )
+    added = len(state.h_walls) + len(state.v_walls) - len(before.h_walls) - len(before.v_walls)
+    return (
+        added == 1
+        and state.h_walls >= before.h_walls
+        and state.v_walls >= before.v_walls
+        and state.walls_left[p] == before.walls_left[p] - 1
+    )
 
 
 V1_DEPTH = 3  # arena / default: fixed depth, deterministic per seed
@@ -343,6 +425,39 @@ def make_v4_fast(seed: int) -> SearchBot:
 
 MATCH_MOVE_TIME = 3.0  # seconds per move for the equal-time matches at a realistic control
 
+V5_DEPTH = V1_DEPTH  # fixed-depth variant for deterministic tests; strength is at equal time
+# v5 (phase 9, steps 3-4, report 0075): v4 + combined wall threats (quoridor.threat): in the
+# eval (root-wall potentials, 2 walls, narrow corridor parts) and at the root (our
+# combination walls and walls breaking the opponent's, 4 at most); a root penalty of two
+# steps per recent return to an own position, progress on equal root scores. Tree
+# repetitions ("rep") and the capped wall stock ("combo_stock") stay off: they lost matches.
+# 1 s per move: 133/200 (66.5%) against v4; anti-shuffle alone 99/200.
+V5_SETTINGS: dict[str, int] = {
+    **V4_SETTINGS,
+    "combo": 20,
+    "combo_k": 3,
+    "combo_beam": 3,
+    "combo_narrow": 3,
+    "combo_root": 4,
+    "rep_penalty": 200,
+    "progress": 1,
+}
+
+
+def make_v5(seed: int) -> SearchBot:
+    """v4 + v5 options (V5_SETTINGS), fixed depth V5_DEPTH."""
+    return SearchBot(seed, depth=V5_DEPTH, **V5_SETTINGS)
+
+
+def make_v5_clock(seed: int) -> SearchBot:
+    """v5 on a 10-minute game clock."""
+    return SearchBot(seed, game_time=GAME_TIME, **V5_SETTINGS)
+
+
+def make_v5_fast(seed: int) -> SearchBot:
+    """v5 with FAST_MOVE_TIME per move (equal-time comparison; not deterministic)."""
+    return SearchBot(seed, move_time=FAST_MOVE_TIME, **V5_SETTINGS)
+
 
 def make_v3_match(seed: int) -> SearchBot:
     """v3 with MATCH_MOVE_TIME per move (equal-time matches at 3 s; not deterministic)."""
@@ -354,6 +469,40 @@ def make_v3_match(seed: int) -> SearchBot:
 def make_v4_match(seed: int) -> SearchBot:
     """v4 with MATCH_MOVE_TIME per move (equal-time matches at 3 s; not deterministic)."""
     return SearchBot(seed, move_time=MATCH_MOVE_TIME, **V4_SETTINGS)
+
+
+def make_v5_match(seed: int) -> SearchBot:
+    """v5 with MATCH_MOVE_TIME per move (equal-time matches at 3 s; not deterministic)."""
+    return SearchBot(seed, move_time=MATCH_MOVE_TIME, **V5_SETTINGS)
+
+
+# MCTS experiment (phase 9, step 5, report 0076): PUCT with a wall-aware policy and the v5
+# eval as the leaf value (quoridor.mcts). Not a default anywhere.
+MCTS_SIMS = 300  # fixed simulations: deterministic per seed (tests); strength is at equal time
+MCTS_SEARCHER: dict[str, int] = {
+    k: val for k, val in V5_SETTINGS.items() if k not in ("rep_penalty", "progress", "tt_bits")
+}
+MCTS_OPTIONS: dict[str, float] = {"rep_penalty": 0.2}
+
+
+def make_mcts(seed: int) -> MCTSBot:
+    """MCTS with MCTS_SIMS simulations per move (deterministic per seed)."""
+    return MCTSBot(seed, sims=MCTS_SIMS, searcher_settings=MCTS_SEARCHER, **MCTS_OPTIONS)
+
+
+def make_mcts_clock(seed: int) -> MCTSBot:
+    """MCTS on a 10-minute game clock."""
+    return MCTSBot(seed, game_time=GAME_TIME, searcher_settings=MCTS_SEARCHER, **MCTS_OPTIONS)
+
+
+def make_mcts_fast(seed: int) -> MCTSBot:
+    """MCTS with FAST_MOVE_TIME per move."""
+    return MCTSBot(seed, move_time=FAST_MOVE_TIME, searcher_settings=MCTS_SEARCHER, **MCTS_OPTIONS)
+
+
+def make_mcts_match(seed: int) -> MCTSBot:
+    """MCTS with MATCH_MOVE_TIME per move."""
+    return MCTSBot(seed, move_time=MATCH_MOVE_TIME, searcher_settings=MCTS_SEARCHER, **MCTS_OPTIONS)
 
 
 def make_v4_frozen(seed: int) -> SearchBot:
@@ -408,6 +557,14 @@ BOTS: dict[str, BotFactory] = {
     "v4-frozen-clock": make_v4_frozen_clock,
     "v4-frozen-0.2s": make_v4_frozen_fast,
     "v4-frozen-3s": make_v4_frozen_match,
+    "v5": make_v5,
+    "v5-clock": make_v5_clock,
+    "v5-0.2s": make_v5_fast,
+    "v5-3s": make_v5_match,
+    "mcts": make_mcts,
+    "mcts-clock": make_mcts_clock,
+    "mcts-0.2s": make_mcts_fast,
+    "mcts-3s": make_mcts_match,
 }
 # Bots whose play does not depend on the seed in a meaningful way (seed only breaks ties):
 # a mirror match of such a bot repeats the same game.
