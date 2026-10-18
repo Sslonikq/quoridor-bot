@@ -67,11 +67,17 @@ def reserve_term(walls_me: int, walls_op: int, reserve: int) -> int:
     last walls are not spent cheaply while the opponent holds a big stock (game06,
     moves 17...-20...), and the side with the big stock keeps it too.
     """
+    return _reserve_threat(walls_op, walls_me, reserve) - _reserve_threat(
+        walls_me, walls_op, reserve
+    )
 
-    def threat(own: int, other: int) -> int:
-        return reserve * RESERVE_SHARE[own] * other // 4 if own < len(RESERVE_SHARE) else 0
 
-    return threat(walls_op, walls_me) - threat(walls_me, walls_op)
+def _reserve_threat(own: int, other: int, reserve: int) -> int:
+    """The threat of `other` walls in stock to a side with `own` walls (reserve_term).
+
+    A module-level function, not a closure inside reserve_term: that one runs in every
+    v4 leaf and must not allocate a function object per call (review 0069 nit)."""
+    return reserve * RESERVE_SHARE[own] * other // 4 if own < len(RESERVE_SHARE) else 0
 
 
 def evaluate_v4(

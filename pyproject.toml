@@ -6,6 +6,8 @@ requires-python = ">=3.11"
 
 [project.optional-dependencies]
 dev = ["pytest", "ruff", "hypothesis"]
+# optional speed-up (phase 9): compiled kernels, quoridor/jit.py; QUORIDOR_NO_NUMBA=1 turns it off
+fast = ["numba"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

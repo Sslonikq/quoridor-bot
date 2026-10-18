@@ -51,6 +51,25 @@ def test_parse_spec_frozen_v4():
         tune.parse_spec("frozen4:tt_bits=18", 0.1)
 
 
+def test_parse_spec_v4_v5_and_mcts():
+    """Report 0076: v4: / v5: (registry settings + overrides) and mcts: specs."""
+    from quoridor.bots import V4_SETTINGS, V5_SETTINGS
+    from quoridor.mcts import MCTSBot
+
+    b = tune.parse_spec("v4:", 0.3)(0)
+    assert isinstance(b, SearchBot) and b.move_time == 0.3
+    assert b._searcher.reserve == V4_SETTINGS["reserve"] and b._searcher.combo == 0
+    b = tune.parse_spec("v5:move_time=1.0", 0.3)(0)
+    assert b.move_time == 1.0 and b._searcher.combo == V5_SETTINGS["combo"]
+    b = tune.parse_spec("mcts:c_puct=2.0", 0.3)(0)
+    assert isinstance(b, MCTSBot) and b.move_time == 0.3 and b._mcts.c_puct == 2.0
+    b = tune.parse_spec("mcts:sims=50", 0.3)(0)
+    assert b.sims == 50 and b.move_time is None
+    assert tune.uses_default_move_time("mcts:") and not tune.uses_default_move_time("mcts:sims=5")
+    with pytest.raises(ValueError):
+        tune.parse_spec("mcts:nope=1", 0.1)
+
+
 def test_max_gap():
     assert tune.max_gap([]) == 0.0
     assert tune.max_gap([5.0]) == 0.0
@@ -97,3 +116,35 @@ def test_tune_main_runs(capsys):
     assert tune.main(["search:depth=1", "greedy", "--games", "4", "--procs", "2"]) == 0
     out = capsys.readouterr().out
     assert "n=4" in out and "dropped 0 game(s)" in out
+
+
+def test_gap_limit_follows_the_move_budget():
+    """Review 0069 minor 3: --max-gap is checked against the per-move budget."""
+    assert tune.gap_limit_for(0.2, None) == tune.MAX_GAP
+    assert tune.gap_limit_for(20.0, None) == pytest.approx(60.0)
+    assert tune.gap_limit_for(5.0, 12.0) == 12.0
+    with pytest.raises(ValueError):
+        tune.gap_limit_for(30.0, 30.0)
+    budget = tune.move_budget_of
+    assert budget(tune.parse_spec("search:move_time=7.5", 0.2)) == 7.5
+    assert budget(tune.parse_spec("search:depth=2", 0.2)) == 0.0
+    assert budget(tune.parse_spec("v4-clock", 0.2)) == tune.MAX_TIME
+    assert budget(tune.parse_spec("greedy", 0.2)) == 0.0
+
+
+def test_max_gap_not_above_move_time_is_an_argparse_error(capsys):
+    with pytest.raises(SystemExit):
+        tune.main(["search:tt_bits=0", "greedy", "--move-time", "40", "--max-gap", "30"])
+    assert "--max-gap" in capsys.readouterr().err
+    # which specs take --move-time (the header names it only for them)
+    assert not tune.uses_default_move_time("v4-3s")
+    assert not tune.uses_default_move_time("search:move_time=1.0")
+    assert tune.uses_default_move_time("search:tt_bits=18")
+    assert tune.uses_default_move_time("frozen4:")
+
+
+@pytest.mark.slow
+def test_tune_header_names_own_time_limits(capsys):
+    assert tune.main(["search:depth=1", "greedy", "--games", "2", "--procs", "1"]) == 0
+    out = capsys.readouterr().out
+    assert "own time limits of the bots" in out and "move_time 0.2" not in out

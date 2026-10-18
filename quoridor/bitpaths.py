@@ -4,7 +4,9 @@ A cell (col, row) is bit row * 9 + col of a Python int. For a wall set four "mov
 allowed" masks are built once (cells whose step up / down / right / left is on the board
 and not blocked); a BFS layer is then a handful of big-int operations instead of a
 Python loop over cells. quoridor.paths stays the reference implementation; tests in
-tests/paths compare the two.
+tests/paths compare the two. With numba (quoridor.jit) distance, player_distance,
+shortest_layers and shortest_path run as compiled kernels (quoridor.kernels) with the same
+results; the Python versions stay as py_* (tests/paths/test_jit.py compares them).
 """
 
 from __future__ import annotations
@@ -146,3 +148,70 @@ def shortest_path(m: Masks, cell: Cell, player: int) -> list[Cell] | None:
                 return path[::-1]
             push(j)
     return None
+
+
+# ---------- numba (phase 9, step 6) ----------
+# The functions above are the pure-Python reference (kept as py_*). With numba on
+# (quoridor.jit.ENABLED) the public names are rebound to wrappers of quoridor.kernels with
+# the same results; the masks are passed as eight 64-bit words (m8).
+
+M64 = (1 << 64) - 1
+# wall code of quoridor.kernels ((y * 8 + x) * 2 + o) -> (x, y, orient)
+WALL_OF_CODE: tuple[tuple[int, int, str], ...] = tuple(
+    (p % 8, p // 8, (H, "v")[o]) for p in range(64) for o in (0, 1)
+)
+# ... -> (x, y, orient, the four "not wall_bits" masks): child masks = m & not-masks
+WALL_NOT_OF_CODE: tuple[tuple, ...] = tuple(
+    (x, y, o, *(~b for b in wall_bits(x, y, o))) for x, y, o in WALL_OF_CODE
+)
+
+py_distance = distance
+py_player_distance = player_distance
+py_shortest_layers = shortest_layers
+py_shortest_path = shortest_path
+
+
+def m8(m: Masks) -> tuple[int, int, int, int, int, int, int, int]:
+    """The masks as eight 64-bit words (lo, hi of up, down, right, left)."""
+    a, b, c, d = m
+    return (a & M64, a >> 64, b & M64, b >> 64, c & M64, c >> 64, d & M64, d >> 64)
+
+
+def _jit_distance(m: Masks, start: int, goal: int) -> int | None:
+    a, b, c, d = m
+    r = _K.distance(
+        a & M64, a >> 64, b & M64, b >> 64, c & M64, c >> 64, d & M64, d >> 64,
+        start & M64, start >> 64, goal & M64, goal >> 64,
+    )  # fmt: skip
+    return None if r < 0 else r
+
+
+def _jit_player_distance(m: Masks, cell: Cell, player: int) -> int | None:
+    a, b, c, d = m
+    r = _K.player_distance(
+        a & M64, a >> 64, b & M64, b >> 64, c & M64, c >> 64, d & M64, d >> 64,
+        cell[1] * N + cell[0], player,
+    )  # fmt: skip
+    return None if r < 0 else r
+
+
+def _jit_shortest_layers(m: Masks, start: int, goal: int) -> list[int] | None:
+    w = _K.shortest_layers(*m8(m), start & M64, start >> 64, goal & M64, goal >> 64).tolist()
+    if not w:
+        return None
+    return [w[i] | (w[i + 1] << 64) for i in range(0, len(w), 2)]
+
+
+def _jit_shortest_path(m: Masks, cell: Cell, player: int) -> list[Cell] | None:
+    p = _K.shortest_path(*m8(m), cell[1] * N + cell[0], player).tolist()
+    return [(i % N, i // N) for i in p] if p else None
+
+
+from quoridor import jit as _jit  # noqa: E402  (after the reference code on purpose)
+
+_K = _jit.kernels()
+if _K is not None:
+    distance = _jit_distance  # type: ignore[assignment]  # noqa: F811
+    player_distance = _jit_player_distance  # type: ignore[assignment]  # noqa: F811
+    shortest_layers = _jit_shortest_layers  # type: ignore[assignment]  # noqa: F811
+    shortest_path = _jit_shortest_path  # type: ignore[assignment]  # noqa: F811

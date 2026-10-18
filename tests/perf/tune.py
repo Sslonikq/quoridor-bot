@@ -9,15 +9,22 @@ A and B are specs:
   frozen:k=v,...            the same, but with the frozen v1 searcher (quoridor.frozen);
   frozen4:k=v,...           the same with the frozen v4 searcher (its own settings), e.g.
                             frozen4: (= v4-frozen at --move-time).
-If move_time/depth/game_time is absent in a `search:`/`frozen*:` spec, --move-time is used.
+  v4:k=v,... / v5:k=v,...   SearchBot with bots.V4_SETTINGS / V5_SETTINGS plus overrides,
+                            e.g. v5:move_time=1.0 or v4: (= v4 at --move-time);
+  mcts:k=v,...              quoridor.mcts.MCTSBot (bots.MCTS_SEARCHER, MCTS_OPTIONS plus
+                            overrides: options of mcts.MCTS_DEFAULTS, sims, move_time).
+If move_time/depth/game_time/sims is absent in such a spec, --move-time is used.
 The games are split between --procs processes (seeds seed, seed+1, ...; colours alternate
 inside every chunk, as in the arena). Both sides play under the same machine load, so the
 result is a comparison at equal time. Prints W/L/D for A, score with the 95% Wilson interval,
 average move time and plies (weighted by games per process) and the wall time of the run.
 Sleep guard: a game in which two consecutive wall-clock stamps (start / end of every move)
-are more than --max-gap seconds apart (default 30: the machine slept or the process was
-suspended, so the clock bots' budgets and the move times are garbage) is dropped; the
-number of dropped games is printed and the statistics are over the remaining ones.
+are more than --max-gap seconds apart (default max(30, 3 * budget), where budget is the
+longest per-move limit of the two bots: move_time, or timeman.MAX_TIME for a game_time
+bot; a jump above it means the machine slept or the process was suspended, so the clock
+bots' budgets and the move times are garbage) is dropped; the number of dropped games is
+printed and the statistics are over the remaining ones. An explicit --max-gap that is not
+above the budget would drop every game, so it is an argparse error (review 0069 minor 3).
 No network, nothing is written to disk.
 """
 
@@ -30,11 +37,25 @@ from collections.abc import Callable, Sequence
 from concurrent.futures import ProcessPoolExecutor
 
 from quoridor.arena import GameResult, run_match, wilson_interval
-from quoridor.bots import BOTS, Bot, BotFactory, SearchBot
+from quoridor.bots import (
+    BOTS,
+    MCTS_OPTIONS,
+    MCTS_SEARCHER,
+    V4_SETTINGS,
+    V5_SETTINGS,
+    Bot,
+    BotFactory,
+    SearchBot,
+)
 from quoridor.frozen import search_v1, search_v4
+from quoridor.mcts import MCTSBot
 from quoridor.state import GameState, Move
+from quoridor.timeman import MAX_TIME
 
 MAX_GAP = 30.0  # seconds between consecutive move stamps: more = the machine slept
+GAP_FACTOR = 3.0  # the default --max-gap is at least GAP_FACTOR * the per-move budget
+_TIME_KEYS = ("move_time", "depth", "game_time", "sims")
+_KINDS = ("search", "frozen", "frozen4", "v4", "v5", "mcts")
 
 
 def parse_spec(spec: str, default_move_time: float) -> BotFactory:
@@ -42,7 +63,7 @@ def parse_spec(spec: str, default_move_time: float) -> BotFactory:
     if spec in BOTS:
         return BOTS[spec]
     kind, _, rest = spec.partition(":")
-    if kind not in ("search", "frozen", "frozen4"):
+    if kind not in _KINDS:
         raise ValueError(f"unknown bot spec {spec!r}")
     kw: dict[str, int | float] = {}
     for item in filter(None, rest.split(",")):
@@ -50,10 +71,15 @@ def parse_spec(spec: str, default_move_time: float) -> BotFactory:
         if not eq:
             raise ValueError(f"bad parameter {item!r} in {spec!r} (expected k=v)")
         kw[k] = float(v) if "." in v else int(v)
-    if not any(k in kw for k in ("move_time", "depth", "game_time")):
+    if not any(k in kw for k in _TIME_KEYS):
         kw["move_time"] = default_move_time
 
-    def factory(seed: int) -> SearchBot:
+    def factory(seed: int) -> Bot:
+        if kind == "mcts":
+            return MCTSBot(seed, searcher_settings=MCTS_SEARCHER, **{**MCTS_OPTIONS, **kw})  # type: ignore[arg-type]
+        if kind in ("v4", "v5"):
+            base = V4_SETTINGS if kind == "v4" else V5_SETTINGS
+            return SearchBot(seed, **{**base, **kw})  # type: ignore[arg-type]
         if kind == "frozen":
             return SearchBot(seed, searcher=search_v1.Searcher(seed), **kw)  # type: ignore[arg-type]
         if kind == "frozen4":
@@ -67,6 +93,40 @@ def parse_spec(spec: str, default_move_time: float) -> BotFactory:
     except TypeError as e:
         raise ValueError(f"bad parameters in {spec!r}: {e}") from e
     return factory
+
+
+def uses_default_move_time(spec: str) -> bool:
+    """True if the spec takes --move-time (a spec of a kind in _KINDS without own limit)."""
+    if spec in BOTS:
+        return False
+    kind, _, rest = spec.partition(":")
+    keys = {item.partition("=")[0] for item in filter(None, rest.split(","))}
+    return kind in _KINDS and not keys & set(_TIME_KEYS)
+
+
+def move_budget_of(factory: BotFactory) -> float:
+    """Longest wall time one move of this bot may plan for (s): its move_time, MAX_TIME
+    of quoridor.timeman for a game_time bot, 0 for depth-only and non-search bots."""
+    bot = factory(0)
+    budget = getattr(bot, "move_time", None) or 0.0
+    if getattr(bot, "game_time", None):
+        budget = max(budget, MAX_TIME)
+    return float(budget)
+
+
+def gap_limit_for(budget: float, max_gap: float | None) -> float:
+    """--max-gap for a run whose slowest bot plans `budget` s per move.
+
+    None -> max(MAX_GAP, GAP_FACTOR * budget). An explicit value <= budget would drop
+    (nearly) every game, so it raises ValueError (review 0069 minor 3)."""
+    if max_gap is None:
+        return max(MAX_GAP, GAP_FACTOR * budget)
+    if max_gap <= budget:
+        raise ValueError(
+            f"--max-gap {max_gap:g} s is not above the per-move budget {budget:g} s: "
+            "every game would be dropped"
+        )
+    return max_gap
 
 
 class StampedBot:
@@ -178,16 +238,21 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--max-gap",
         type=float,
-        default=MAX_GAP,
-        help=f"drop games with a wall-clock gap between moves above this (s, default {MAX_GAP:g})",
+        default=None,
+        help="drop games with a wall-clock gap between moves above this "
+        f"(s, default max({MAX_GAP:g}, {GAP_FACTOR:g} * per-move budget))",
     )
     ns = p.parse_args(argv)
-    parse_spec(ns.a, ns.move_time)  # validate early, in the parent
-    parse_spec(ns.b, ns.move_time)
+    # validate early, in the parent
+    budget = max(move_budget_of(parse_spec(s, ns.move_time)) for s in (ns.a, ns.b))
+    try:
+        gap_limit = gap_limit_for(budget, ns.max_gap)
+    except ValueError as e:
+        p.error(str(e))
     procs = max(1, min(ns.procs, ns.games))
     base, extra = divmod(ns.games, procs)
     jobs = [
-        (ns.a, ns.b, ns.move_time, base + (i < extra), ns.seed + i, ns.max_moves, ns.max_gap)
+        (ns.a, ns.b, ns.move_time, base + (i < extra), ns.seed + i, ns.max_moves, gap_limit)
         for i in range(procs)
     ]
     t0 = time.perf_counter()
@@ -202,11 +267,15 @@ def main(argv: list[str] | None = None) -> int:
         f"Wilson95 [{100 * lo_ci:.1f}, {100 * hi_ci:.1f}]"
     )
     print(
-        f"dropped {dropped} game(s) (wall-clock gap between moves > {ns.max_gap:g} s: "
+        f"dropped {dropped} game(s) (wall-clock gap between moves > {gap_limit:g} s: "
         "sleep / suspend); the statistics are over the other games"
     )
     print(f"avg move time A {1000 * ta:.0f} ms, B {1000 * tb:.0f} ms; avg plies {pl:.0f}")
-    print(f"elapsed {time.perf_counter() - t0:.0f} s ({procs} procs, move_time {ns.move_time})")
+    if uses_default_move_time(ns.a) or uses_default_move_time(ns.b):
+        timing = f"move_time {ns.move_time:g} for specs without own limit"
+    else:
+        timing = "own time limits of the bots"
+    print(f"elapsed {time.perf_counter() - t0:.0f} s ({procs} procs, {timing})")
     return 0
 
 
