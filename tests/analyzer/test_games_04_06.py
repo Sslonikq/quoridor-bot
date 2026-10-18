@@ -112,9 +112,16 @@ def test_analyzer_hint_beats_the_played_move_by_evaluate_move(name, n):
 @pytest.mark.slow
 @pytest.mark.parametrize("n", [33, 35, 37, 39])
 def test_game06_analyzer_keeps_the_last_walls(n):
-    """game06 17...-20...: black has <= 2 walls, white all 10; the top-1 is not a wall."""
+    """game06 17...-20...: black has <= 2 walls, white all 10; a wall is not strictly best.
+
+    Robust to the order of TIED moves (18...: f4 and b5h are both -2.05 at 5 s): a pawn move in
+    the top scores as well as the top-1 (black to move, so lower is better).
+    """
     moves = moves_of("game06.txt")[:n]
     state = engine.replay(moves)
     assert state.turn == 1 and state.walls_left[0] == 10 and state.walls_left[1] <= 2
     res = engine.analyze(moves, 3.0)
-    assert res["top"][0]["k"] == "p", (n, res["top"])
+    top = res["top"]
+    pawns = [t["score"] for t in top if t["k"] == "p"]
+    assert pawns, (n, top)
+    assert min(pawns) <= min(t["score"] for t in top), (n, top)
