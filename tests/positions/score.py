@@ -20,12 +20,22 @@ Criteria (positions.json, `checks`; see loader.CHECK_TYPES):
                 (own cell, own walls left) must not repeat (more than max_repeats times);
   any_of        any of the nested checks holds.
 Results go to arena_results/positions/ (ignored by git) unless --out says otherwise.
+
+Robust metric (one time-sensitive position must not decide the outcome):
+  --runs N          N independent runs (seeds 0..N-1), default 3; the headline figure is the
+                    MEDIAN share of correct positions over the runs (min/max are printed too),
+                    and for every position the share of runs in which it passed;
+  --budget sims=N   fixed MCTS simulations per move (no clock: deterministic, one run is
+                    enough, --runs defaults to 1 then);
+  --budget depth=D  fixed alpha-beta depth per move (same).
+Without --budget the bot plays on --time seconds per move (timing noise: use 3 runs).
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import statistics
 import sys
 import time
 from collections.abc import Callable
@@ -57,18 +67,42 @@ class Outcome:
     repeats: int | None = None
 
 
-def make_scored_bot(name: str, seconds: float, seed: int = 0) -> Bot:
+@dataclass(frozen=True)
+class Budget:
+    """Fixed work per move instead of a clock: kind is "sims" (MCTS) or "depth" (alpha-beta)."""
+
+    kind: str
+    value: int
+
+    def __str__(self) -> str:
+        return f"{self.kind}={self.value}"
+
+
+def parse_budget(text: str) -> Budget:
+    kind, sep, raw = text.partition("=")
+    if not sep or kind not in ("sims", "depth") or not raw.isdigit() or int(raw) < 1:
+        raise ValueError(f"bad budget {text!r}: expected sims=N or depth=D (N, D >= 1)")
+    return Budget(kind, int(raw))
+
+
+def make_scored_bot(name: str, seconds: float, seed: int = 0, budget: Budget | None = None) -> Bot:
     """Registry bot with `seconds` per move (SearchBot: no fixed depth, no game clock;
-    MCTSBot: no simulation count, no game clock)."""
+    MCTSBot: no simulation count, no game clock). With `budget` the bot works a fixed amount
+    (depth / simulations) with no clock at all; a budget of the wrong kind for the bot is an
+    error, bots without search (random, greedy) ignore it."""
     bot = make_bot(name, seed)
     if isinstance(bot, SearchBot):
-        bot.depth = None
+        if budget is not None and budget.kind != "depth":
+            raise ValueError(f"{name} is an alpha-beta bot: use --budget depth=D")
+        bot.depth = budget.value if budget else None
         bot.game_time = None
-        bot.move_time = seconds
+        bot.move_time = None if budget else seconds
     elif isinstance(bot, MCTSBot):
-        bot.sims = None
+        if budget is not None and budget.kind != "sims":
+            raise ValueError(f"{name} is an MCTS bot: use --budget sims=N")
+        bot.sims = budget.value if budget else None
         bot.game_time = None
-        bot.move_time = seconds
+        bot.move_time = None if budget else seconds
     return bot
 
 
@@ -226,9 +260,15 @@ def judge(pos: Position, out: Outcome) -> tuple[bool, list[bool]]:
     )
 
 
-def evaluate(bot_name: str, seconds: float, pos: Position) -> Verdict:
+def evaluate(
+    bot_name: str,
+    seconds: float,
+    pos: Position,
+    seed: int = 0,
+    budget: Budget | None = None,
+) -> Verdict:
     """Fresh bot per position (the same seed), so that positions do not influence each other."""
-    bot = make_scored_bot(bot_name, seconds)
+    bot = make_scored_bot(bot_name, seconds, seed, budget)
     t0 = time.perf_counter()
     out = play_position(bot, pos)
     dt = time.perf_counter() - t0
@@ -236,10 +276,10 @@ def evaluate(bot_name: str, seconds: float, pos: Position) -> Verdict:
     return Verdict(pos, ok, soft, out, dt)
 
 
-def _job(args: tuple[str, float, str]) -> Verdict:
-    bot_name, seconds, pid = args
+def _job(args: tuple[str, float, str, int, Budget | None]) -> Verdict:
+    bot_name, seconds, pid, seed, budget = args
     pos = next(p for p in load_positions(validate=False) if p.id == pid)
-    return evaluate(bot_name, seconds, pos)
+    return evaluate(bot_name, seconds, pos, seed, budget)
 
 
 def run_all(
@@ -248,20 +288,78 @@ def run_all(
     positions: list[Position],
     procs: int = 1,
     on_verdict: Callable[[Verdict], None] | None = None,
+    seed: int = 0,
+    budget: Budget | None = None,
 ) -> list[Verdict]:
     if procs <= 1:
         out = []
         for p in positions:
-            v = evaluate(bot_name, seconds, p)
+            v = evaluate(bot_name, seconds, p, seed, budget)
             if on_verdict:
                 on_verdict(v)
             out.append(v)
         return out
     with ProcessPoolExecutor(procs) as ex:
-        res = list(ex.map(_job, [(bot_name, seconds, p.id) for p in positions]))
+        res = list(ex.map(_job, [(bot_name, seconds, p.id, seed, budget) for p in positions]))
     for v in res:
         if on_verdict:
             on_verdict(v)
+    return res
+
+
+def run_many(
+    bot_name: str,
+    seconds: float,
+    positions: list[Position],
+    runs: int = 3,
+    procs: int = 1,
+    budget: Budget | None = None,
+    on_verdict: Callable[[int, Verdict], None] | None = None,
+) -> list[list[Verdict]]:
+    """`runs` independent runs over the positions (run i uses seed i); a list per run."""
+    return [
+        run_all(
+            bot_name,
+            seconds,
+            positions,
+            procs,
+            (lambda v, i=i: on_verdict(i, v)) if on_verdict else None,
+            seed=i,
+            budget=budget,
+        )
+        for i in range(runs)
+    ]
+
+
+def pass_rates(runs: list[list[Verdict]]) -> dict[str, tuple[int, int]]:
+    """Per position id: (runs in which it passed, number of runs)."""
+    res: dict[str, tuple[int, int]] = {}
+    for run in runs:
+        for v in run:
+            ok, n = res.get(v.pos.id, (0, 0))
+            res[v.pos.id] = (ok + v.ok, n + 1)
+    return res
+
+
+def run_shares(runs: list[list[Verdict]], key: str = "all") -> list[float]:
+    """Share of correct positions in each run (key: a summary key: all, core, sign, ...)."""
+    shares = []
+    for run in runs:
+        ok, n = summary(run)[key]
+        shares.append(ok / n if n else 0.0)
+    return shares
+
+
+def median_min_max(values: list[float]) -> tuple[float, float, float]:
+    return statistics.median(values), min(values), max(values)
+
+
+def moves_by_run(runs: list[list[Verdict]]) -> dict[str, list[str]]:
+    """Per position id: the move chosen in each run."""
+    res: dict[str, list[str]] = {}
+    for run in runs:
+        for v in run:
+            res.setdefault(v.pos.id, []).append(format_move(v.out.move))
     return res
 
 
@@ -318,6 +416,65 @@ def report(bot_name: str, seconds: float, verdicts: list[Verdict], with_lines: b
     return "\n".join(lines)
 
 
+def report_runs(
+    bot_name: str, seconds: float, runs: list[list[Verdict]], budget: Budget | None = None
+) -> str:
+    """Multi-run report: per position the share of runs passed, then median (min/max)."""
+    rates = pass_rates(runs)
+    moves = moves_by_run(runs)
+    limit = str(budget) if budget else f"{seconds:g}s"
+    lines = [
+        f"bot={bot_name} per move={limit} runs={len(runs)} positions={len(runs[0])} "
+        "(* = core: v4 >= +3)",
+        "pass rate per position (runs passed / runs), moves per run:",
+    ]
+    for v in runs[0]:
+        ok, n = rates[v.pos.id]
+        star = "*" if v.pos.core else " "
+        flaky = "  <- unstable" if 0 < ok < n else ""
+        lines.append(
+            f"  {star}{v.pos.id:<16} {ok}/{n} = {100 * ok / n:3.0f}%  "
+            f"{' '.join(moves[v.pos.id])}{flaky}"
+        )
+    lines.append("")
+    for label, key in (
+        ("all positions", "all"),
+        ("core positions", "core"),
+        ("  sign of the evaluation", "sign"),
+        ("  move (forbid/want/cage)", "move"),
+        ("  no shuffling", "shuffle"),
+    ):
+        med, lo, hi = median_min_max(run_shares(runs, key))
+        goal = f"   (goal >= {PASS_SHARE:.0%})" if key == "all" else ""
+        lines.append(
+            f"{label + ':':<30} median {100 * med:.0f}%  min {100 * lo:.0f}%  "
+            f"max {100 * hi:.0f}%{goal}"
+        )
+    lines.append("per run, all positions: " + " ".join(f"{100 * x:.0f}%" for x in run_shares(runs)))
+    return "\n".join(lines)
+
+
+def dump_runs(
+    path: Path,
+    bot_name: str,
+    seconds: float,
+    runs: list[list[Verdict]],
+    budget: Budget | None = None,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    med, lo, hi = median_min_max(run_shares(runs))
+    data = {
+        "bot": bot_name,
+        "time": seconds,
+        "budget": str(budget) if budget else None,
+        "runs": len(runs),
+        "all": {"median": med, "min": lo, "max": hi, "per_run": run_shares(runs)},
+        "pass_rate": {k: list(v) for k, v in pass_rates(runs).items()},
+        "moves": moves_by_run(runs),
+    }
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=1), "utf-8")
+
+
 def dump(path: Path, bot_name: str, seconds: float, verdicts: list[Verdict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     data = {
@@ -346,6 +503,15 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="python -m tests.positions.score", description=__doc__)
     ap.add_argument("--bot", default="v4", help="name from quoridor.bots.BOTS (default v4)")
     ap.add_argument("--time", type=float, default=3.0, help="seconds per move (default 3)")
+    ap.add_argument(
+        "--budget",
+        help="fixed work per move instead of --time: sims=N (MCTS) or depth=D (alpha-beta)",
+    )
+    ap.add_argument(
+        "--runs",
+        type=int,
+        help="runs; the result is the median share (default 3, with --budget 1)",
+    )
     ap.add_argument("--only", help="comma-separated position ids")
     ap.add_argument("--procs", type=int, default=1, help="processes (timing noise grows)")
     ap.add_argument("--out", type=Path, help="result JSON (default arena_results/positions/...)")
@@ -355,20 +521,43 @@ def main(argv: list[str] | None = None) -> int:
         ap.error(f"unknown bot {args.bot!r}; known: {', '.join(sorted(BOTS))}")
     if args.time <= 0:
         ap.error("--time must be positive")
+    budget = None
+    if args.budget:
+        try:
+            budget = parse_budget(args.budget)
+            make_scored_bot(args.bot, args.time, 0, budget)  # kind vs bot
+        except ValueError as e:
+            ap.error(str(e))
+    runs_n = args.runs if args.runs is not None else (1 if budget else 3)
+    if runs_n < 1:
+        ap.error("--runs must be >= 1")
     positions = load_positions()
     if args.only:
         want = set(args.only.split(","))
         positions = [p for p in positions if p.id in want]
         if len(positions) != len(want):
             ap.error("unknown id in --only")
-    verdicts = run_all(
-        args.bot, args.time, positions, args.procs, lambda v: print(line(v), flush=True)
+    runs = run_many(
+        args.bot,
+        args.time,
+        positions,
+        runs_n,
+        args.procs,
+        budget,
+        lambda i, v: print(f"[run {i + 1}] {line(v)}", flush=True),
     )
     print()
-    print(report(args.bot, args.time, verdicts).split("\n", 1 + len(verdicts))[-1])
+    if runs_n == 1:
+        print(report(args.bot, args.time, runs[0]).split("\n", 1 + len(runs[0]))[-1])
+    else:
+        print(report_runs(args.bot, args.time, runs, budget))
     if not args.no_dump:
-        out = args.out or OUT_DIR / f"{args.bot}-{args.time:g}s.json"
-        dump(out, args.bot, args.time, verdicts)
+        tag = str(budget).replace("=", "") if budget else f"{args.time:g}s"
+        out = args.out or OUT_DIR / f"{args.bot}-{tag}.json"
+        if runs_n == 1:
+            dump(out, args.bot, args.time, runs[0])
+        else:
+            dump_runs(out, args.bot, args.time, runs, budget)
         print(f"saved: {out}")
     return 0
 

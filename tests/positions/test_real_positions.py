@@ -260,7 +260,85 @@ def test_results_dir_is_git_ignored():
     reason="phase 9 goal: >= 80% of the real positions; baseline of v4 is below (reports/0074)",
 )
 def test_v4_handles_80_percent_of_the_real_positions():
-    verdicts = score.run_all("v4", 3.0, POSITIONS)
-    score.dump(score.OUT_DIR / "pytest-v4-3s.json", "v4", 3.0, verdicts)
-    ok, n = score.summary(verdicts)["all"]
-    assert ok / n >= score.PASS_SHARE, score.report("v4", 3.0, verdicts)
+    """A fixed depth instead of 3 s on the clock (reports 0080, 0082): deterministic, so
+    one run is the median of any number of runs and the verdict does not depend on the
+    load of the machine. Depth 10 is about what v4 completes in 3 s (18 s for the set)."""
+    budget = score.parse_budget("depth=10")
+    runs = score.run_many("v4", 0.0, POSITIONS, runs=1, budget=budget)
+    score.dump_runs(score.OUT_DIR / "pytest-v4-depth10.json", "v4", 0.0, runs, budget)
+    med, _, _ = score.median_min_max(score.run_shares(runs))
+    assert med >= score.PASS_SHARE, score.report_runs("v4", 0.0, runs, budget)
+
+
+# ---- the robust metric: runs, median, fixed budgets ----------------------------------------
+
+
+def fake_run(passed: set[str]) -> list[score.Verdict]:
+    out = []
+    for pid in ("g03-m17", "g04-m11", "g06-p35"):
+        pos = BY_ID[pid]
+        out.append(score.Verdict(pos, pid in passed, [], outcome("e2"), 0.0))
+    return out
+
+
+def test_median_and_pass_rates_over_runs():
+    runs = [fake_run({"g03-m17"}), fake_run({"g03-m17", "g04-m11", "g06-p35"}), fake_run(set())]
+    assert score.pass_rates(runs) == {"g03-m17": (2, 3), "g04-m11": (1, 3), "g06-p35": (1, 3)}
+    shares = score.run_shares(runs)
+    assert shares == pytest.approx([1 / 3, 1.0, 0.0])
+    assert score.median_min_max(shares) == pytest.approx((1 / 3, 0.0, 1.0))
+    text = score.report_runs("v4", 1.0, runs)
+    assert "g03-m17" in text and "2/3" in text and "unstable" in text
+    assert "median 33%" in text and "min 0%" in text and "max 100%" in text
+
+
+def test_one_flaky_position_does_not_decide_the_median():
+    steady = {"g03-m17", "g04-m11"}
+    runs = [fake_run(steady), fake_run(steady | {"g06-p35"}), fake_run(steady)]
+    assert score.median_min_max(score.run_shares(runs))[0] == pytest.approx(2 / 3)
+
+
+def test_parse_budget():
+    assert score.parse_budget("sims=50") == score.Budget("sims", 50)
+    assert score.parse_budget("depth=3") == score.Budget("depth", 3)
+    for bad in ("sims", "sims=", "sims=0", "time=3", "depth=x", "sims=-1"):
+        with pytest.raises(ValueError):
+            score.parse_budget(bad)
+
+
+def test_budget_sets_a_fixed_amount_and_no_clock():
+    b = score.make_scored_bot("v4", 9.0, budget=score.Budget("depth", 2))
+    assert b.depth == 2 and b.move_time is None and b.game_time is None
+    m = score.make_scored_bot("mcts", 9.0, budget=score.Budget("sims", 30))
+    assert m.sims == 30 and m.move_time is None and m.game_time is None
+    with pytest.raises(ValueError, match="depth"):
+        score.make_scored_bot("v4", 1.0, budget=score.Budget("sims", 5))
+    with pytest.raises(ValueError, match="sims"):
+        score.make_scored_bot("mcts", 1.0, budget=score.Budget("depth", 2))
+
+
+def test_depth_budget_is_deterministic_and_has_that_depth():
+    budget = score.Budget("depth", 2)
+    a = score.run_all("v4", 9.0, [BY_ID["g04-m11"]], budget=budget)[0]
+    b = score.run_all("v4", 9.0, [BY_ID["g04-m11"]], budget=budget)[0]
+    assert a.out.depth == 2
+    assert (format_move(a.out.move), a.out.score) == (format_move(b.out.move), b.out.score)
+
+
+def test_cli_budget_and_runs(capsys, tmp_path):
+    out = tmp_path / "r.json"
+    args = ["--bot", "v4", "--budget", "depth=2", "--only", "g04-m11", "--out", str(out)]
+    assert score.main([*args, "--runs", "2"]) == 0
+    text = capsys.readouterr().out
+    assert "[run 2]" in text and "median" in text and "runs=2" in text
+    data = json.loads(out.read_text("utf-8"))
+    assert data["runs"] == 2 and data["budget"] == "depth=2"
+    assert data["pass_rate"]["g04-m11"][1] == 2
+    assert score.main(args) == 0  # a budget: one run by default
+    assert "[run 2]" not in capsys.readouterr().out
+
+
+def test_cli_rejects_a_bad_budget_and_runs():
+    for extra in (["--budget", "x=1"], ["--budget", "sims=5"], ["--runs", "0"]):
+        with pytest.raises(SystemExit):
+            score.main(["--bot", "v4", *extra, "--no-dump"])
