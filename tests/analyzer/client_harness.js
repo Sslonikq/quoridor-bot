@@ -24,9 +24,9 @@ const ctx = { document: doc, getComputedStyle: () => ({ getPropertyValue: () => 
     calls.push(path);
     const req = o && o.body ? JSON.parse(o.body) : {};
     bodies.push([path, req]);
-    if (path === "/api/analyze" && req.time === 20)  // deep analysis: the reply is released by the test
-      return new Promise(res => { pendingDeep = () => res({ json: async () => ({ ok: true, top: DEEP_TOP, eval: 0, eval_mate: false, depth: 12, elapsed: 20 }) }); });
-    if (path === "/api/progress") return { json: async () => ({ ok: true, busy: true, depth: 7 }) };
+    if (path === "/api/analyze" && req.time === 30)  // deep analysis: the reply is released by the test
+      return new Promise(res => { pendingDeep = () => res({ json: async () => ({ ok: true, top: DEEP_TOP, eval: 0, eval_mate: false, depth: 12, elapsed: 30 }) }); });
+    if (path === "/api/progress") return { json: async () => ({ ok: true, busy: true, depth: 7, sims: 1234 }) };
     if (path === "/api/analyze" && globalThis.__staleCancels > 0) {  // a late foreign cancel kills this request
       globalThis.__staleCancels--;
       return { json: async () => ({ ok: true, cancelled: true }) };
@@ -72,9 +72,11 @@ const out = {};
   run("line = ['e2','e8','e3']; ply = 0; drawGraph()");
   els.graph.onclick({ clientX: 0, clientY: 0 });
   out.mainPly = run("ply");
-  // 6. default hint time is 5 s
+  // 6. default hint time is 10 s (normal), the default bot is MCTS
   reset(); bodies.length = 0; run("rv = null; hintOn = true; line = []; ply = 0; ana = null"); run("refresh()"); await tick();
   out.defaultTime = bodies.filter(b => b[0] === "/api/analyze").map(b => b[1].time);
+  out.defaultBot = bodies.filter(b => b[0] === "/api/analyze").map(b => b[1].bot);
+  out.initialBot = run("bot");
   // 7. deep mode: time=20, in progress, replaced by a new analysis on a position change
   reset(); bodies.length = 0; run('setMode("deep")'); await tick();
   out.deepTime = bodies.filter(b => b[0] === "/api/analyze").map(b => b[1].time);
@@ -110,6 +112,7 @@ const out = {};
   reset(); run('setMode("deep")');  // the reply stays pending: the progress poll runs
   await new Promise(r => setTimeout(r, 650));
   out.polled = calls.includes("/api/progress"); out.liveMsg = els.anaMsg.textContent;
+  run('bot = "v4"'); run("renderLive()"); out.liveMsgV4 = els.anaMsg.textContent; run('bot = "mcts"');
   // 13. a foreign cancel kills the current request: it is repeated once and the result arrives
   run("cancelAnalysis()"); run('setMode("normal")'); run("cancelAnalysis()"); await tick();
   globalThis.__okAnalyze = true; globalThis.__staleCancels = 1; reset();
@@ -118,6 +121,22 @@ const out = {};
   // 14. cancelled twice in a row: no hang in the busy state
   globalThis.__staleCancels = 5; run("clearLive(); ana = null"); run("analyze()"); await tick();
   out.stuckState = run("anaState");
+  // 14b. bot switch: the choice goes to the server, is remembered, restarts the analysis
+  globalThis.__staleCancels = 0;   run("clearLive(); ana = null; hintOn = true; rv = null"); run('setBot("v5")'); await tick();
+  out.botSwitchBodies = bodies.filter(b => b[0] === "/api/analyze").slice(-1).map(b => b[1].bot);
+  out.botStored = store.get("quoridor.analyzer.bot");
+  out.botDoneMark = run("ana && ana.botName");
+  reset(); run('setBot("v5")'); await tick(); out.botSameCalls = calls.slice();   // the same bot: nothing happens
+  run('setBot("bogus")'); run('setBot("constructor")'); out.botBogus = run("bot");
+  run("hintOn = false; ana = null"); bodies.length = 0; run('setBot("v4")'); await tick(); out.botHintOff = bodies.length;
+  run("hintOn = true"); run('setBot("mcts")'); await tick();
+  out.botBack = bodies.filter(b => b[0] === "/api/analyze").slice(-1).map(b => b[1].bot);
+  store.set("quoridor.analyzer.bot", "v4"); out.loadedBotV4 = run("loadBot()");
+  store.set("quoridor.analyzer.bot", "bogus"); out.loadedBotBogus = run("loadBot()");
+  store.set("quoridor.analyzer.bot", "constructor"); out.loadedBotProto = run("loadBot()");
+  store.delete("quoridor.analyzer.bot"); out.loadedBotNone = run("loadBot()");
+  globalThis.__lsThrow = true; out.loadedBotThrow = run("loadBot()"); run('setBot("v5")'); out.botAfterThrow = run("bot"); globalThis.__lsThrow = false;
+  run('setBot("mcts")'); await tick();
   // 15. the mode is remembered in localStorage; a broken or missing storage does not break anything
   out.reloaded = run("loadMode()");
   out.stored = store.get("quoridor.analyzer.mode");

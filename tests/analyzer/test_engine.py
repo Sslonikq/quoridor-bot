@@ -385,3 +385,55 @@ def test_search_top_main_search_gets_the_whole_budget(monkeypatch):
     monkeypatch.setattr(Searcher, "_search", spy)
     engine.analyze(["e2", "e8"], 0.5)
     assert seen == [0.5]
+
+
+# ---- bots of the analyzer: v4 / v5 / MCTS (phase 9, step 1) ----
+
+
+def test_mcts_analysis_top_moves_are_legal_and_sorted_by_visits():
+    from quoridor.analyzer import engine
+
+    res = engine.analyze(["e2", "e8", "e3", "e7"], 0.5, bot="mcts")
+    legal = {m["name"] for m in res["position"]["legal"]}
+    top = res["top"]
+    assert 1 <= len(top) <= 3 and {t["name"] for t in top} <= legal
+    assert len({t["name"] for t in top}) == len(top)
+    assert top[0]["visits"] >= max(t["visits"] for t in top[1:] or top)
+    assert res["bot"] == "mcts" and 0 < top[0]["visits"] <= res["sims"] + 1
+    assert res["depth"] == top[0]["depth"] >= 1
+    # alternatives are never shown above the best move (side to move: white)
+    assert all(t["score"] <= top[0]["score"] for t in top)
+
+
+def test_mcts_and_v5_win_on_the_spot_and_report_the_bot():
+    from quoridor.analyzer import engine
+
+    moves = ["e2", "e8", "e3", "e7", "e4", "e6", "e5", "d6", "e6", "d5", "e7", "d4", "e8", "d3"]
+    for bot in ("mcts", "v5"):
+        res = engine.analyze(moves, 0.3, bot=bot)
+        assert res["bot"] == bot and res["top"][0]["name"] == "e9" and res["top"][0]["mate"]
+
+
+def test_unknown_bot_raises_value_error():
+    from quoridor.analyzer import engine
+
+    with pytest.raises(ValueError):
+        engine.analyze([], 0.2, bot="v3")
+
+
+def test_mcts_cancel_stops_within_a_simulation_and_progress_is_reported():
+    import time
+
+    from quoridor.analyzer import engine
+
+    seen = []
+    t0 = time.perf_counter()
+    res = engine.analyze(
+        [],
+        10,
+        lambda: time.perf_counter() - t0 > 0.5,
+        lambda d, n=0: seen.append((d, n)),
+        "mcts",
+    )
+    assert res["cancelled"] and res["top"] == [] and time.perf_counter() - t0 < 2
+    assert seen and seen[-1][1] > 0 and seen[-1][0] >= 1

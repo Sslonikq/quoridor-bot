@@ -1,12 +1,14 @@
 """Local JSON API + static files. Binds 127.0.0.1 only, a random free port by default.
 
   POST /api/state    {"moves": [...]}              -> position, legal moves, winner
-  POST /api/analyze  {"moves": [...], "time": 3.0} -> top-3 moves of v4, evaluation, depth
-                     ("time" is optional: engine.DEFAULT_TIME)
+  POST /api/analyze  {"moves": [...], "time": 3.0, "bot": "mcts"} -> top-3 moves, evaluation,
+                     depth ("time" is optional: engine.DEFAULT_TIME; "bot" is "v4" | "v5" |
+                     "mcts", default engine.DEFAULT_BOT; anything else is a 400)
   POST /api/evaluate {"moves": [...], "move": "e3h", "time": 3.0}
                      -> score of that one move in the position after "moves" (engine.evaluate_move)
-  POST /api/progress {}                            -> {"busy", "depth"}: live depth (completed
-                     iterations) of the running analysis; depth 0 before the first one
+  POST /api/progress {}                            -> {"busy", "depth", "sims"}: live depth
+                     (completed iterations; MCTS: length of the main line) of the running
+                     analysis, 0 before the first one; sims = MCTS simulations so far (else 0)
   POST /api/cancel   {}                            -> cancels the running analysis / evaluation
   POST /api/parse    {"text": "d1 e8 ..."}         -> {"moves": [...]}: a pasted game (see
                      engine.parse_game_text), replayed and validated
@@ -116,6 +118,7 @@ class AnalyzerServer(ThreadingHTTPServer):
         self._job_lock = threading.Lock()
         self._job: threading.Event | None = None
         self._depth = 0  # live depth of the current analysis (see on_depth)
+        self._sims = 0  # MCTS simulations of the current analysis
         self._review: ReviewJob | None = None
         self._review_seq = 0
 
@@ -131,17 +134,19 @@ class AnalyzerServer(ThreadingHTTPServer):
                 self._job.set()
             self._job = ev
             self._depth = 0
+            self._sims = 0
         return ev
 
-    def on_depth(self, ev: threading.Event, depth: int) -> None:
+    def on_depth(self, ev: threading.Event, depth: int, sims: int = 0) -> None:
         """Progress of the analysis `ev`; ignored once a newer one has replaced it."""
         with self._job_lock:
             if self._job is ev:
                 self._depth = depth
+                self._sims = sims
 
     def progress(self) -> dict:
         with self._job_lock:
-            return {"busy": self._job is not None, "depth": self._depth}
+            return {"busy": self._job is not None, "depth": self._depth, "sims": self._sims}
 
     def start_review(self, moves: list[str], seconds: float) -> ReviewJob:
         """Start a review; the previous review and the running analysis are cancelled."""
@@ -327,12 +332,16 @@ class Handler(BaseHTTPRequestHandler):
                 cancel = self.server.start_job()
                 res = engine.evaluate_move(moves, move, float(seconds), cancel.is_set)
                 return self._json(200, {"ok": True, **res})
+            bot = body.get("bot", engine.DEFAULT_BOT)
+            if not isinstance(bot, str) or bot not in engine.BOTS:
+                return self._error(400, f"bot must be one of: {', '.join(engine.BOTS)}")
             cancel = self.server.start_job()
             res = engine.analyze(
                 moves,
                 float(seconds),
                 cancel.is_set,
-                lambda d: self.server.on_depth(cancel, d),
+                lambda d, n=0: self.server.on_depth(cancel, d, n),
+                bot,
             )
             if res["cancelled"]:
                 return self._json(200, {"ok": True, "cancelled": True})

@@ -49,22 +49,23 @@ def test_graph_click_in_branch_stays_at_common_start(result):
     assert result["mainPly"] == 3
 
 
-def test_default_hint_time_is_5s(result):
-    assert result["defaultTime"] == [5]
+def test_default_hint_time_is_10s_and_default_bot_is_mcts(result):
+    assert result["defaultTime"] == [10]
+    assert result["defaultBot"] == ["mcts"] and result["initialBot"] == "mcts"
 
 
 def test_default_mode_is_normal_and_nothing_stored_at_start(result):
     assert result["initialMode"] == "normal" and result["initialStore"] == 0
 
 
-def test_deep_mode_requests_20s_and_shows_progress(result):
-    assert result["deepTime"] == [20]
+def test_deep_mode_requests_30s_and_shows_progress(result):
+    assert result["deepTime"] == [30]
     assert result["deepRunning"] and result["deepProgShown"]
 
 
 def test_position_change_restarts_analysis_in_the_same_mode(result):
     assert result["deepAfterMove"]
-    assert result["deepMoveTimes"] == [20]
+    assert result["deepMoveTimes"] == [30]
     # the new /api/analyze cancels the old one on the server itself
     assert "/api/cancel" not in result["deepMoveCalls"]
 
@@ -76,12 +77,12 @@ def test_escape_cancels_the_search_in_any_mode(result):
 
 def test_click_on_busy_mode_cancels_and_on_idle_mode_recalculates(result):
     assert not result["clickCancel"] and "/api/cancel" in result["clickCalls"]
-    assert result["clickRestart"] == [20]
+    assert result["clickRestart"] == [30]
 
 
 def test_result_is_marked_with_the_mode(result):
     assert not result["doneLive"] and result["doneMark"] == "deep"
-    assert "Глубоко, 20 с" in result["doneMsg"]
+    assert "Глубоко, 30 с" in result["doneMsg"]
 
 
 def test_mode_change_starts_nothing_without_hint_or_during_review(result):
@@ -89,13 +90,16 @@ def test_mode_change_starts_nothing_without_hint_or_during_review(result):
 
 
 def test_each_mode_sends_its_time_without_a_racing_cancel(result):
-    assert result["modeTimes"] == {"fast": [1], "normal": [5]}
+    assert result["modeTimes"] == {"fast": [2], "normal": [10]}
     assert "/api/analyze" in result["modeCalls"] and "/api/cancel" not in result["modeCalls"]
 
 
 def test_live_depth_is_polled_in_every_mode(result):
-    assert result["polled"] and "глубина 7" in result["liveMsg"]
-    assert "Глубоко" in result["liveMsg"]
+    assert result["polled"] and "Глубоко" in result["liveMsg"]
+    # MCTS: the main line and the simulations; alpha-beta bots: the depth
+    assert "главная линия 7" in result["liveMsg"] and "1234 симуляций" in result["liveMsg"]
+    assert "MCTS" in result["liveMsg"]
+    assert "глубина 7" in result["liveMsgV4"] and "симуляций" not in result["liveMsgV4"]
 
 
 def test_mode_is_remembered_in_local_storage(result):
@@ -113,3 +117,19 @@ def test_broken_local_storage_does_not_break_the_mode_switch(result):
 def test_foreign_cancel_of_current_request_is_retried_once(result):
     assert result["raceCalls"] == 2 and result["raceState"] == "done"
     assert result["stuckState"] == "idle"  # a second cancel does not leave "busy" forever
+
+
+def test_bot_switch_sends_the_bot_remembers_it_and_restarts(result):
+    assert result["botSwitchBodies"] == ["v5"] and result["botStored"] == "v5"
+    assert result["botDoneMark"] == "v5"
+    assert result["botSameCalls"] == []  # the same bot: no recalculation
+    assert result["botBogus"] == "v5"  # unknown names (also "constructor") are ignored
+    assert result["botHintOff"] == 0  # hint off: only the choice changes
+    assert result["botBack"] == ["mcts"]
+
+
+def test_bot_is_loaded_from_local_storage_with_a_safe_default(result):
+    assert result["loadedBotV4"] == "v4"
+    assert result["loadedBotBogus"] == result["loadedBotProto"] == "mcts"
+    assert result["loadedBotNone"] == result["loadedBotThrow"] == "mcts"
+    assert result["botAfterThrow"] == "v5"  # a broken storage does not block the switch

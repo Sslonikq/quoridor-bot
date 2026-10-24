@@ -290,12 +290,12 @@ def test_oversized_body_and_bad_time(server):
 
 
 def test_explicit_time_up_to_30_is_accepted(server, monkeypatch):
-    """Deep analysis sends time=20; the server passes it on unclamped (max 30)."""
+    """Deep analysis sends time=30; the server passes it on unclamped (max 30)."""
     from quoridor.analyzer import engine
 
     seen = []
 
-    def fake(moves, seconds, cancelled, on_depth=None):
+    def fake(moves, seconds, cancelled, on_depth=None, bot="v4"):
         seen.append(seconds)
         return {"cancelled": True}
 
@@ -307,19 +307,19 @@ def test_explicit_time_up_to_30_is_accepted(server, monkeypatch):
 
 
 def test_mode_times_fast_normal_deep_are_accepted_as_is(server, monkeypatch):
-    """The client's modes send 1 / 5 / 20 s; every one reaches the engine unchanged."""
+    """The client's modes send 2 / 10 / 30 s; every one reaches the engine unchanged."""
     from quoridor.analyzer import engine
 
     seen = []
 
-    def fake(moves, seconds, cancelled, on_depth=None):
+    def fake(moves, seconds, cancelled, on_depth=None, bot="v4"):
         seen.append(seconds)
         return {"cancelled": True}
 
     monkeypatch.setattr(engine, "analyze", fake)
-    for t in (1, 5, 20):
+    for t in (2, 10, 30):
         assert post(server, "/api/analyze", {"moves": [], "time": t})[0] == 200
-    assert seen == [1.0, 5.0, 20.0]
+    assert seen == [2.0, 10.0, 30.0]
 
 
 @pytest.mark.parametrize(
@@ -474,7 +474,10 @@ def test_rejected_evaluate_does_not_cancel_the_running_analysis(server):
 
 
 def test_progress_reports_live_depth_of_the_running_analysis(server):
-    assert post(server, "/api/progress", {}) == (200, {"ok": True, "busy": False, "depth": 0})
+    assert post(server, "/api/progress", {}) == (
+        200,
+        {"ok": True, "busy": False, "depth": 0, "sims": 0},
+    )
     out = {}
     t = threading.Thread(
         target=lambda: out.update(a=post(server, "/api/analyze", {"moves": [], "time": 4}))
@@ -502,3 +505,75 @@ def test_stale_job_does_not_overwrite_progress(server):
     assert server.progress()["depth"] == 0
     server.on_depth(new, 3)
     assert server.progress()["depth"] == 3
+
+
+# ---- the bot parameter of /api/analyze (phase 9, step 1) ----
+
+
+@pytest.mark.parametrize("bot", ["v4", "v5", "mcts"])
+def test_analyze_runs_the_chosen_bot(server, bot):
+    status, res = post(server, "/api/analyze", {"moves": ["e2", "e8"], "time": 0.5, "bot": bot})
+    assert status == 200 and res["bot"] == bot and 1 <= len(res["top"]) <= 3
+    assert res["eval"] == res["top"][0]["score"] and res["depth"] >= 1
+    if bot == "mcts":
+        assert res["sims"] > 0 and all(t["visits"] > 0 for t in res["top"])
+    else:
+        assert "sims" not in res
+
+
+def test_bot_is_passed_to_the_engine_and_defaults_to_v4(server, monkeypatch):
+    from quoridor.analyzer import engine
+
+    seen = []
+
+    def fake(moves, seconds, cancelled, on_depth=None, bot="v4"):
+        seen.append(bot)
+        return {"cancelled": True}
+
+    monkeypatch.setattr(engine, "analyze", fake)
+    for body in ({}, {"bot": "mcts"}, {"bot": "v5"}):
+        assert post(server, "/api/analyze", {"moves": [], "time": 1, **body})[0] == 200
+    assert seen == ["v4", "mcts", "v5"]
+
+
+@pytest.mark.parametrize("bad", ["v3", "MCTS", "", "constructor", None, 4, True, ["mcts"]])
+def test_unknown_bot_is_rejected(server, bad):
+    status, res = post(server, "/api/analyze", {"moves": [], "time": 0.2, "bot": bad})
+    assert status == 400 and not res["ok"] and "bot" in res["error"]
+
+
+def test_mcts_analysis_is_cancelled_by_cancel_and_by_a_newer_request(server):
+    out = {}
+
+    def run():
+        out["a"] = post(server, "/api/analyze", {"moves": [], "time": 10, "bot": "mcts"})
+
+    th = threading.Thread(target=run)
+    th.start()
+    time.sleep(0.6)
+    t0 = time.perf_counter()
+    assert post(server, "/api/cancel", {})[0] == 200
+    th.join(5)
+    assert not th.is_alive() and time.perf_counter() - t0 < 3
+    assert out["a"][1] == {"ok": True, "cancelled": True}
+
+    out.clear()
+    th = threading.Thread(target=run)
+    th.start()
+    time.sleep(0.6)
+    status, res = post(server, "/api/analyze", {"moves": ["e2"], "time": 0.3, "bot": "mcts"})
+    th.join(5)
+    assert status == 200 and not th.is_alive() and res["top"]
+    assert out["a"][1] == {"ok": True, "cancelled": True}
+
+
+def test_progress_reports_depth_and_simulations_of_a_running_mcts(server):
+    th = threading.Thread(
+        target=post, args=(server, "/api/analyze", {"moves": [], "time": 3, "bot": "mcts"})
+    )
+    th.start()
+    time.sleep(1.0)
+    status, res = post(server, "/api/progress", {})
+    post(server, "/api/cancel", {})
+    th.join(5)
+    assert status == 200 and res["busy"] and res["sims"] > 0 and res["depth"] >= 1

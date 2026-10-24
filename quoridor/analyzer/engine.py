@@ -11,8 +11,9 @@ import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 
-from quoridor.bots import V4_SETTINGS
+from quoridor.bots import MCTS_OPTIONS, MCTS_SEARCHER, V4_SETTINGS, V5_SETTINGS
 from quoridor.eval import WIN
+from quoridor.mcts import MCTS, PROGRESS_EVERY, MCTSCancelled
 from quoridor.notation import format_move, parse_move
 from quoridor.paths import shortest_path_length
 from quoridor.rules import apply_move, apply_move_unchecked, legal_moves, pawn_moves, winner
@@ -21,7 +22,10 @@ from quoridor.state import GameState, Move, PawnMove, goal_row
 
 MAX_MOVES = 400  # more than any real game (arena limit is 300 plies)
 DEFAULT_TIME = 5.0  # seconds per hint (the UI may send its own "time")
-DEEP_TIME = 20.0  # "Глубокий анализ" button (UI sends it explicitly)
+DEEP_TIME = 20.0  # kept for compatibility; the UI modes are 2 / 10 / 30 s (it sends "time")
+BOTS = ("v4", "v5", "mcts")  # white list of the "bot" parameter
+DEFAULT_BOT = "v4"  # API default when "bot" is absent (the UI sends its own: MCTS by default)
+MCTS_SEED = 0
 MIN_TIME = 0.1
 MAX_TIME = 30.0  # upper bound of an explicit "time"; the server rejects more
 TOP_N = 3
@@ -115,10 +119,10 @@ class _Cancelled(Exception):
 
 
 class _CancellableSearcher(Searcher):
-    """v4 searcher that aborts as soon as `cancelled()` turns true (checked at every leaf)."""
+    """v4 / v5 searcher that aborts as soon as `cancelled()` turns true (checked at every leaf)."""
 
-    def __init__(self, cancelled: Callable[[], bool]) -> None:
-        super().__init__(0, **V4_SETTINGS)
+    def __init__(self, cancelled: Callable[[], bool], settings: dict | None = None) -> None:
+        super().__init__(0, **(V4_SETTINGS if settings is None else settings))
         self._cancelled = cancelled
 
     def evaluate(self, state: GameState) -> int:
@@ -133,19 +137,58 @@ class RankedMove:
     score: int  # display centi-steps for the side to move (WIN-ish for proven results)
     depth: int = 1  # plies from the root at which the score was found
     exact: bool = True  # False: an upper bound (an alternative that was only refuted)
+    visits: int = 0  # MCTS only: simulations that went through this root move
 
 
 def _score_white(state: GameState, score: int) -> int:
     return score if state.turn == 0 else -score
 
 
+def _rank_mcts(
+    state: GameState,
+    budget: float,
+    cancelled: Callable[[], bool],
+    on_progress: Callable[[int, int], None] | None,
+) -> tuple[list[RankedMove], int, int]:
+    """Top moves of the PUCT-MCTS (the bot of bots.make_mcts_*), the whole budget in one
+    search: the best move is the bot's choice, the others are the other most visited root
+    moves (by visits, then by value; no alternative is shown above the best). Returns
+    (moves, depth, simulations); depth is the length of the most visited line.
+    ([], 0, n) when cancelled. Cancellation is checked between simulation batches (a few
+    ms), progress (line, simulations) is reported at most every PROGRESS_EVERY s."""
+    mcts = MCTS(MCTS_SEED, MCTS_SEARCHER, **MCTS_OPTIONS)
+    try:
+        res = mcts.search(
+            state,
+            None,
+            budget,
+            should_stop=cancelled,
+            on_progress=on_progress,
+            progress_every=PROGRESS_EVERY,
+        )
+    except MCTSCancelled as e:
+        return [], 0, e.sims
+    best = RankedMove(res.move, res.score, res.depth, True, res.visits)
+    ranked = [best]
+    rest = [c for c in mcts.root_children() if c.move != res.move and c.visits > 0]
+    rest.sort(key=lambda c: (c.proven != -1, c.visits, c.value), reverse=True)
+    for c in rest[: TOP_N - 1]:
+        ranked.append(
+            RankedMove(c.move, min(c.score, best.score), c.depth, c.score <= best.score, c.visits)
+        )
+    return ranked, res.depth, res.nodes
+
+
 def rank_moves(
     state: GameState,
     budget: float,
     cancelled: Callable[[], bool] = lambda: False,
-    on_depth: Callable[[int], None] | None = None,
+    on_depth: Callable[..., None] | None = None,
+    bot: str = DEFAULT_BOT,
 ) -> tuple[list[RankedMove], int]:
-    """Top moves of v4. Returns (moves best first, depth of the best move from the root).
+    """Top moves of `bot` ("v4" | "v5" | "mcts"). For "mcts" see _rank_mcts; the rest of
+    this text is about v4 / v5 (same search, v5 has its own settings).
+    Returns (moves best first, depth of the best move from the root).
 
     The best move comes from ONE ordinary search (Searcher.search_top: the same search
     as SearchBot.choose_move with move_time = budget, TT, iterative deepening, so the same
@@ -162,7 +205,12 @@ def rank_moves(
     wins = [m for m in pawn_moves(state) if m.row == goal]
     if wins:
         return [RankedMove(m, WIN - 1) for m in wins[:TOP_N]], 1
-    searcher = _CancellableSearcher(cancelled)
+    if bot not in BOTS:
+        raise ValueError(f"unknown bot {bot!r}")
+    if bot == "mcts":
+        ranked, depth, _ = _rank_mcts(state, budget, cancelled, on_depth)
+        return ranked, depth
+    searcher = _CancellableSearcher(cancelled, V5_SETTINGS if bot == "v5" else None)
     searcher.on_depth = on_depth  # live depth of the main search (completed iterations)
     try:
         res = searcher.search_top(state, budget, TOP_N, ALT_SHARE)
@@ -265,6 +313,7 @@ def _top_entries(state: GameState, ranked: list[RankedMove]) -> list[dict]:
                 "why": _why(state, r.move, child, r.score),
                 "depth": r.depth,  # plies from the position for this score
                 "exact": r.exact,  # False: an upper bound ("not better than")
+                **({"visits": r.visits} if r.visits else {}),  # MCTS: simulations through it
             }
         )
     return top
@@ -274,7 +323,8 @@ def analyze(
     moves: object,
     seconds: float = DEFAULT_TIME,
     cancelled: Callable[[], bool] = lambda: False,
-    on_depth: Callable[[int], None] | None = None,
+    on_depth: Callable[..., None] | None = None,
+    bot: str = DEFAULT_BOT,
 ) -> dict:
     """Top-3 moves with scores and reasons, plus the position evaluation (white's view).
 
@@ -283,7 +333,12 @@ def analyze(
     (plies of that entry's search) and exact (False: an upper bound). The top-level
     `depth` is the depth of the best move's search, counted from the analysed position
     (see rank_moves). `on_depth(d)` is called after every completed iteration (live depth).
+    `bot` is "v4" | "v5" | "mcts" (ValueError otherwise); the result carries it as "bot".
+    For MCTS: depth = length of the main line, `on_depth(d, sims)`, entries have "visits",
+    the result has "sims" (simulations done).
     """
+    if bot not in BOTS:
+        raise ValueError(f"unknown bot {bot!r}")
     state = replay(moves)
     pos = describe(state, moves)
     if winner(state) is not None:
@@ -293,11 +348,16 @@ def analyze(
             "eval": None,
             "eval_mate": False,
             "depth": 0,
+            "bot": bot,
             "cancelled": False,
         }
     seconds = _clamp_time(seconds)
     t0 = time.perf_counter()
-    ranked, depth = rank_moves(state, seconds, cancelled, on_depth)
+    sims = 0
+    if bot == "mcts" and not any(m.row == goal_row(state.turn) for m in pawn_moves(state)):
+        ranked, depth, sims = _rank_mcts(state, seconds, cancelled, on_depth)
+    else:
+        ranked, depth = rank_moves(state, seconds, cancelled, on_depth, bot)
     if cancelled() or not ranked:
         return {
             "position": pos,
@@ -305,11 +365,14 @@ def analyze(
             "eval": None,
             "eval_mate": False,
             "depth": 0,
+            "bot": bot,
             "cancelled": True,
         }
     top = _top_entries(state, ranked)
     return {
         "position": pos,
+        "bot": bot,
+        **({"sims": sims} if bot == "mcts" else {}),
         "top": top,
         "eval": top[0]["score"],
         "eval_mate": top[0]["mate"],
