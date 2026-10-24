@@ -1,9 +1,14 @@
-"""Phase 9, step 5 (report 0076): MCTS with a wall-aware policy (quoridor.mcts)."""
+"""MCTS with a wall-aware policy (quoridor.mcts): phase 9, step 5 (report 0076) and the
+array core on numba (report 0082), which must build exactly the tree of the Python core."""
+
+from collections import Counter
 
 import pytest
 
+from quoridor import jit
+from quoridor import mcts as mcts_mod
 from quoridor.bots import BOTS, MCTS_OPTIONS, MCTS_SEARCHER, RandomBot, make_bot
-from quoridor.mcts import MCTS, MCTSBot
+from quoridor.mcts import MCTS, MCTSBot, MCTSCancelled
 from quoridor.rules import apply_move, is_legal_move, pawn_moves, winner
 from quoridor.state import BLACK, WHITE, GameState, PawnMove, WallMove
 from tests.search.test_search_speed import positions
@@ -11,8 +16,12 @@ from tests.search.test_search_speed import positions
 PROVEN = 1_000_000 - 2
 
 
-def mcts(seed: int = 0, **opts) -> MCTS:
-    return MCTS(seed, MCTS_SEARCHER, **{**MCTS_OPTIONS, **opts})
+CORES = ["py", pytest.param("jit", marks=pytest.mark.skipif(not jit.ENABLED, reason="numba off"))]
+needs_jit = pytest.mark.skipif(not jit.ENABLED, reason=f"numba off: {jit.REASON}")
+
+
+def mcts(seed: int = 0, core: str | None = None, **opts) -> MCTS:
+    return MCTS(seed, MCTS_SEARCHER, core, **{**MCTS_OPTIONS, **opts})
 
 
 def state(white, black, turn, walls=(10, 10), h=(), v=()):
@@ -65,18 +74,24 @@ def test_proven_loss_is_reported():
     assert r.score == -PROVEN
 
 
-def test_moves_are_legal_in_the_whole_tree():
-    m = mcts()
+@pytest.mark.parametrize("core", CORES)
+def test_moves_are_legal_in_the_whole_tree(core):
+    m = mcts(core=core)
     for s in positions([71, 72], every=5, max_plies=60, wall_bias=0.7)[:10]:
-        m._root = None
         m.search(s, sims=60)
+        count = 0
+        for st, moves in m._iter_tree():
+            count += 1
+            for mv in moves:
+                assert is_legal_move(st, mv), (st, mv)
+        assert count >= 2
+    if core == "py":  # the stored child states are the applied moves
         stack = [m._root]
         while stack:
             node = stack.pop()
             if node is None or node.moves is None:
                 continue
             for mv, child, kid in zip(node.moves, node.states, node.kids, strict=True):
-                assert is_legal_move(node.state, mv), (node.state, mv)
                 assert child == apply_move(node.state, mv)
                 stack.append(kid)
 
@@ -119,13 +134,138 @@ def test_tree_is_reused_after_the_opponent_move():
     assert bot.last.visits > bot.last.nodes == 200
 
 
-def test_repetition_penalty_hits_returning_moves():
-    m = mcts(rep_penalty=0.5)
+@pytest.mark.parametrize("core", CORES)
+def test_repetition_penalty_hits_returning_moves(core):
+    m = mcts(core=core, rep_penalty=0.5)
     s0 = state((4, 3), (4, 6), WHITE)
     hist = [state((3, 3), (4, 7), WHITE), state((4, 3), (4, 7), BLACK)]
     m.set_history(hist)
     r = m.search(s0, sims=50)
-    pen = m._penalties(m._root)
-    by_move = dict(zip(m._root.moves, pen, strict=True))
+    by_move = {c.move: c.penalty for c in m.root_children()}
     assert by_move[PawnMove(3, 3)] == 0.5 and by_move[PawnMove(5, 3)] == 0.0
     assert r.move != PawnMove(3, 3)
+
+
+# ---------- public API (report 0082) ----------
+
+
+@pytest.mark.parametrize("core", CORES)
+def test_root_children(core):
+    m = mcts(core=core)
+    r = m.search(GameState.initial(), sims=300)
+    kids = m.root_children()
+    assert sum(c.visits for c in kids) == r.visits - 1  # the root's own first visit
+    best = max(kids, key=lambda c: c.visits)
+    assert best.move == r.move and best.score == r.score and best.depth == r.depth
+    assert all((c.value is None) == (c.visits == 0) for c in kids)
+    assert m.pv_length() == r.depth
+    # a proven win in one: nothing to list
+    m.search(state((4, 7), (0, 4), WHITE), sims=10)
+    assert m.root_children() == []
+
+
+@pytest.mark.parametrize("core", CORES)
+def test_should_stop_and_progress(core):
+    m = mcts(core=core)
+    calls = []
+    n = [0]
+
+    def stop():
+        n[0] += 1
+        return n[0] > 3
+
+    with pytest.raises(MCTSCancelled) as e:
+        m.search(GameState.initial(), time_limit=5.0, should_stop=stop)
+    assert e.value.sims >= 1
+    r = m.search(
+        GameState.initial(),
+        time_limit=0.3,
+        on_progress=lambda line, sims: calls.append((line, sims)),
+        progress_every=0.05,
+    )
+    assert calls and all(line >= 1 and 0 < sims <= r.nodes for line, sims in calls)
+    assert [s for _, s in calls] == sorted(s for _, s in calls)
+
+
+def test_core_choice():
+    with pytest.raises(ValueError):
+        MCTS(0, MCTS_SEARCHER, "gpu")
+    assert mcts(leaf_depth=1).core == "py"  # not in the jit core: the reference runs
+    assert mcts(core="py").core == "py"
+    assert mcts().core == ("jit" if jit.ENABLED else "py")
+    if jit.ENABLED:
+        with pytest.raises(ValueError):
+            mcts(core="jit", rollout=2)
+        with pytest.raises(ValueError):
+            MCTS(0, {**MCTS_SEARCHER, "combo_exact": 1}, "jit")
+    else:
+        with pytest.raises(ValueError):
+            mcts(core="jit")
+
+
+# ---------- the jit core builds the tree of the Python core ----------
+
+
+def _snapshot(m: MCTS, r) -> tuple:
+    tree = Counter((st, tuple(moves)) for st, moves in m._iter_tree())
+    return (r.move, r.score, r.depth, r.nodes, r.visits, r.max_depth), m.root_children(), tree
+
+
+def _both(s, sims, seed=0, history=(), **opts):
+    out = []
+    for core in ("jit", "py"):
+        m = mcts(seed, core, **opts)
+        m.set_history(list(history))
+        out.append(_snapshot(m, m.search(s, sims=sims)))
+    return out
+
+
+@needs_jit
+def test_jit_equals_python_on_random_positions():
+    ps = positions([71, 72, 73, 74], every=4, max_plies=90, wall_bias=0.75)
+    assert len(ps) >= 60
+    for i, s in enumerate(ps):
+        a, b = _both(s, 250, seed=i)
+        assert a == b, (i, s)
+
+
+@needs_jit
+def test_jit_equals_python_in_special_positions():
+    cases = [
+        state((4, 7), (0, 4), BLACK),  # saving walls (white wins next move)
+        state((4, 7), (0, 4), BLACK, walls=(10, 0)),  # proven loss
+        state((4, 3), (4, 5), WHITE, walls=(0, 6)),  # only black has walls: wall race
+        state((4, 3), (4, 5), BLACK, walls=(3, 0)),  # only white has walls
+        state((4, 4), (4, 5), WHITE, walls=(2, 1), h=[(3, 5), (5, 5)], v=[(3, 3)]),  # jumps
+        state((0, 1), (8, 7), WHITE, walls=(1, 1)),
+    ]
+    for s in cases:
+        for opts in ({}, {"rep_penalty": 0.0, "fpu": 0.0}):
+            a, b = _both(s, 400, seed=3, **opts)
+            assert a == b, (s, opts)
+
+
+@needs_jit
+def test_jit_equals_python_with_history_reuse_and_growth(monkeypatch):
+    """Whole games of two bots per core: history (rep_penalty), tree reuse and (tiny
+    initial arrays) growth on the jit side; every move and result is the same."""
+    monkeypatch.setattr(mcts_mod, "_NODES0", 64)
+    monkeypatch.setattr(mcts_mod, "_EDGES0", 512)
+
+    def game(core):
+        a = MCTSBot(4, sims=150, searcher_settings=MCTS_SEARCHER, core=core, **MCTS_OPTIONS)
+        b = MCTSBot(5, sims=120, searcher_settings=MCTS_SEARCHER, core=core, **MCTS_OPTIONS)
+        s = GameState.initial()
+        out = []
+        for _ in range(40):
+            if winner(s) is not None:
+                break
+            bot = a if s.turn == WHITE else b
+            mv = bot.choose_move(s)
+            out.append((mv, bot.last.score, bot.last.visits, bot.last.depth))
+            s = apply_move(s, mv)
+        return out
+
+    jg, pg = game("jit"), game("py")
+    assert jg == pg
+    assert any(v > 150 for _, _, v, _ in jg)  # some trees were reused

@@ -8,6 +8,8 @@ exactly what its Python reference returns (tests/paths/test_jit.py compares them
   combo                                      <- quoridor.threat.combo_threat
   cand_walls                                 <- search.Searcher.candidate_walls (no threat
                                                 branch, children are built by the caller)
+  mcts_run, mcts_pv, mcts_count, mcts_compact <- the simulations of quoridor.mcts on a tree
+                                                of arrays (section "MCTS tree" below)
 
 Bitboards: a cell (col, row) is bit row * 9 + col of an 81-bit set (as in bitpaths); here
 the set is two uint64 words, lo = bits 0..63 and hi = bits 64..80. Wall masks are the
@@ -20,6 +22,8 @@ results live in quoridor.bitpaths, quoridor.threat and quoridor.search.
 """
 
 from __future__ import annotations
+
+import math
 
 import numpy as np
 
@@ -753,3 +757,870 @@ def cand_walls(m0, m1, m2, m3, m4, m5, m6, m7, my_cell, op_cell, me, limit):
             break
     out[0] = n
     return out[: 1 + 4 * n]
+
+
+# ---------- MCTS tree (phase 9, step 3 "MCTS speed") ----------
+#
+# The whole simulation of quoridor.mcts (selection, leaf eval, expansion, backup) on
+# arrays. The tree is node arrays (visits, value sum, proven, first edge, edge count)
+# and edge arrays (move code, prior, child node); the position is carried along the
+# path from the root, no states are stored. Exact port of the pure-Python MCTS with its
+# searcher settings (tests/search/test_mcts.py compares the two trees):
+#   _pawn_moves  <- search.pawn_moves_m / rules.pawn_moves_for
+#   _eval        <- search.Searcher.evaluate (v1-v3 / v4, threat, reserve, combo on the
+#                   root walls; combo_exact = combo_stock = 0)
+#   _race_best   <- the first entry of race_cands (Searcher._race_cands)
+#   _cand_walls  <- Searcher.candidate_walls without the threat branch (as cand_walls)
+#   _saving      <- Searcher._saving_walls
+#   _expand      <- mcts.MCTS._expand_lists of an inner node: pawn moves, then the
+#                   candidate (or saving) walls; seeded shuffle, stable sort, softmax
+#   _rand        <- mcts._splitmix (the seeded order of equal children)
+# Move codes: 0..80 a pawn move to that cell, WALL_MOVE + wall code a wall.
+
+IP_WALL_WEIGHT = 0
+IP_V4 = 1
+IP_THREAT = 2
+IP_RESERVE = 3
+IP_COMBO = 4
+IP_COMBO_K = 5
+IP_COMBO_BEAM = 6
+IP_COMBO_NARROW = 7
+IP_COMBO_COST = 8
+IP_RACE_PLAN = 9
+IP_RACE_SOFT = 10
+IP_RACE_MIN_GAIN = 11
+IP_WALL_LIMIT = 12
+IP_SIZE = 13
+
+FP_C_PUCT = 0
+FP_SCALE = 1
+FP_FPU = 2
+FP_PAWN = 3
+FP_WALL = 4
+FP_GAIN = 5
+FP_BEHIND = 6
+FP_SAVING = 7
+FP_TEMPO = 8
+FP_SIZE = 9
+
+WALL_MOVE = 128  # move code of wall w: WALL_MOVE + w
+_STEP = 100  # eval.STEP
+_RACE = 5_000  # eval.RACE
+MAX_PATH = 4096  # deepest selection path (never reached in practice)
+MAX_MOVES = 256  # more than any node has (5 pawn moves + saving / candidate walls)
+
+ST_DONE = 0  # the requested simulations ran
+ST_FULL = 1  # the tree arrays are full: grow them and call again
+ST_PROVEN = 2  # the root is proven
+ST_ONE = 3  # one root move and >= 2 simulations: nothing to choose
+
+_GOLDEN = _U(0x9E3779B97F4A7C15)
+_MIX1 = _U(0xBF58476D1CE4E5B9)
+_MIX2 = _U(0x94D049BB133111EB)
+_S27 = _U(27)
+_S30 = _U(30)
+_S31 = _U(31)
+
+
+def _pawn_tables() -> tuple[np.ndarray, np.ndarray]:
+    """PT[u, k] = (d, n, jump, side1, t1, side2, t2) as search._pawn_table; PTN[u] = k."""
+    dirs = ((0, 1), (0, -1), (1, 0), (-1, 0))
+    pt = np.full((81, 4, 7), -1, dtype=np.int64)
+    ptn = np.zeros(81, dtype=np.int64)
+    for u in range(81):
+        c, r = u % N, u // N
+        k = 0
+        for d, (dc, dr) in enumerate(dirs):
+            nc, nr = c + dc, r + dr
+            if not (0 <= nc < N and 0 <= nr < N):
+                continue
+            jc, jr = nc + dc, nr + dr
+            sides = []
+            for sc, sr in ((dr, dc), (-dr, -dc)):
+                sides += [dirs.index((sc, sr)), (nr + sr) * N + nc + sc]
+            j = jr * N + jc if 0 <= jc < N and 0 <= jr < N else -1
+            pt[u, k] = (d, nr * N + nc, j, *sides)
+            k += 1
+        ptn[u] = k
+    return pt, ptn
+
+
+PT, PTN = _pawn_tables()
+
+
+@njit(cache=True)
+def _rand(rng):
+    s = rng[0] + _GOLDEN
+    rng[0] = s
+    z = (s ^ (s >> _S30)) * _MIX1
+    z = (z ^ (z >> _S27)) * _MIX2
+    return z ^ (z >> _S31)
+
+
+@njit(cache=True)
+def _pawn_moves(m, u, o, out):
+    """search.pawn_moves_m: target cells of the pawn moves from u (other pawn on o), in
+    the order of rules.pawn_moves_for; returns their number."""
+    cnt = 0
+    for k in range(PTN[u]):
+        d = PT[u, k, 0]
+        if not _bit(m[2 * d], m[2 * d + 1], u):
+            continue
+        n = PT[u, k, 1]
+        if n != o:
+            out[cnt] = n
+            cnt += 1
+        elif _bit(m[2 * d], m[2 * d + 1], n):
+            out[cnt] = PT[u, k, 2]
+            cnt += 1
+        else:
+            s1 = PT[u, k, 3]
+            if _bit(m[2 * s1], m[2 * s1 + 1], n):
+                out[cnt] = PT[u, k, 4]
+                cnt += 1
+            s2 = PT[u, k, 5]
+            if _bit(m[2 * s2], m[2 * s2 + 1], n):
+                out[cnt] = PT[u, k, 6]
+                cnt += 1
+    return cnt
+
+
+@njit(cache=True)
+def _goal(p):
+    return N - 1 if p == 0 else 0
+
+
+@njit(cache=True)
+def _wins_now(m, u, o, p, tmp):
+    """Player p on u (the other pawn on o) can step onto its goal row
+    (search.opponent_winning_moves is not empty)."""
+    g = _goal(p)
+    if abs(u // N - g) > 2:
+        return False
+    k = _pawn_moves(m, u, o, tmp)
+    for i in range(k):
+        if tmp[i] // N == g:
+            return True
+    return False
+
+
+@njit(cache=True)
+def _add_bit(b, p):
+    return b | (ONE << _U(p))
+
+
+@njit(cache=True)
+def _place(m, hb, vb, w):
+    """Masks and wall sets after wall w."""
+    m = _with_wall(m, w)
+    if w & 1 == 0:
+        hb = _add_bit(hb, w >> 1)
+    else:
+        vb = _add_bit(vb, w >> 1)
+    return m, hb, vb
+
+
+CACHE_BITS = 16  # memo of _race_best / _wall_race results: 2**16 slots (~5 MB)
+CACHE_WORDS = 9  # key: the eight mask words + one word (kind, cell, player, walls)
+_HMUL = _U(0xFF51AFD7ED558CCD)
+
+
+@njit(cache=True)
+def _slot(m, extra, size):
+    h = extra * _GOLDEN
+    for i in range(8):
+        h = (h ^ m[i]) * _HMUL
+        h ^= h >> _S31
+    return np.int64(h & _U(size - 1))
+
+
+@njit(cache=True)
+def _hit(ck, slot, m, extra):
+    if ck[slot, 8] != extra:
+        return False
+    for i in range(8):
+        if ck[slot, i] != m[i]:
+            return False
+    return True
+
+
+@njit(cache=True)
+def _store(ck, cv, slot, m, extra, a, b, c):
+    for i in range(8):
+        ck[slot, i] = m[i]
+    ck[slot, 8] = extra
+    cv[slot, 0] = a
+    cv[slot, 1] = b
+    cv[slot, 2] = c
+
+
+@njit(cache=True)
+def _race_best_c(m, hb, vb, cell, b, ll, lh, seen, ck, cv):
+    """_race_best memoised in (ck, cv) by (masks, cell, b); always-replace slots. The
+    wall sets follow from the masks, so the key is exact."""
+    extra = _U(1 + (cell << 2) + (b << 9))
+    slot = _slot(m, extra, ck.shape[0])
+    if _hit(ck, slot, m, extra):
+        return cv[slot, 0], cv[slot, 1], cv[slot, 2], cv[slot, 2] >= 0
+    d_b, nb, w, found = _race_best(m, hb, vb, cell, b, ll, lh, seen)
+    _store(ck, cv, slot, m, extra, d_b, nb, w)
+    return d_b, nb, w, found
+
+
+@njit(cache=True)
+def _race_best(m, hb, vb, cell, b, ll, lh, seen):
+    """(d_b, nb, wall, found): B's distance and the first entry of race_cands (largest new
+    distance, then (x, y seen from B's side, orient)), without building the list."""
+    sl, sh = _cell(cell)
+    gl = GOAL[b, 0]
+    gh = GOAL[b, 1]
+    n = _layers(m, sl, sh, gl, gh, ll, lh)
+    d_b = n - 1
+    best_key = np.int64(1) << 62
+    best_nb = -1
+    best_w = -1
+    seen[:] = False
+    for k in range(d_b):
+        if _pop(ll[k]) + _pop(lh[k]) > 2 or _pop(ll[k + 1]) + _pop(lh[k + 1]) > 2:
+            continue
+        for u in range(81):
+            if not _bit(ll[k], lh[k], u):
+                continue
+            for d in range(4):
+                if not _bit(m[2 * d], m[2 * d + 1], u):
+                    continue
+                if d == 0:
+                    j = u + N
+                elif d == 1:
+                    j = u - N
+                elif d == 2:
+                    j = u + 1
+                else:
+                    j = u - 1
+                if not _bit(ll[k + 1], lh[k + 1], j):
+                    continue
+                for e in range(2):
+                    w = EW[d, u, e]
+                    if w < 0 or seen[w]:
+                        continue
+                    seen[w] = True
+                    if not _fits(hb, vb, w):
+                        continue
+                    nb = _dist(_with_wall(m, w), sl, sh, gl, gh)
+                    if nb != NO_DIST and nb > d_b:
+                        p = w >> 1
+                        x = p % 8
+                        y = p // 8
+                        yb = y if b == 0 else 7 - y
+                        key = ((200 - nb) << 8) | (x << 4) | (yb << 1) | (w & 1)
+                        if key < best_key:
+                            best_key = key
+                            best_nb = nb
+                            best_w = w
+    return d_b, best_nb, best_w, best_w >= 0
+
+
+@njit(cache=True)
+def _wall_race(m, hb, vb, bcell, b, n, min_gain, ll, lh, seen, ck, cv):
+    """(walls used, B's distance after them): Searcher.wall_race's greedy plan, memoised
+    by (masks, B's cell, b, n) like the Python one."""
+    extra = _U(2 + (bcell << 2) + (b << 9) + (n << 10) + (min_gain << 20))
+    slot = _slot(m, extra, ck.shape[0])
+    if _hit(ck, slot, m, extra):
+        return cv[slot, 0], cv[slot, 1]
+    m0 = m
+    used = 0
+    while True:
+        d_b, nb, w, found = _race_best_c(m, hb, vb, bcell, b, ll, lh, seen, ck, cv)
+        if used >= n or not found or nb - d_b < min_gain:
+            break
+        m, hb, vb = _place(m, hb, vb, w)
+        used += 1
+    _store(ck, cv, slot, m0, extra, used, d_b, 0)
+    return used, d_b
+
+
+@njit(cache=True)
+def _potential(ct, rm, cell, player, walls, d_now, ip):
+    """Searcher.potential on the root walls rm (combo_exact = 0), the combination search
+    memoised in ct[player, cell] = [computed, d0, levels, best_d...]."""
+    if ct[player, cell, 0] == 0:
+        r = combo(
+            rm[0], rm[1], rm[2], rm[3], rm[4], rm[5], rm[6], rm[7],
+            cell, player, ip[IP_COMBO_K], ip[IP_COMBO_BEAM], ip[IP_COMBO_NARROW],
+        )  # fmt: skip
+        ct[player, cell, 1] = r[0]
+        ct[player, cell, 2] = r[1]
+        for i in range(r[1]):
+            ct[player, cell, 3 + i] = r[2 + i]
+        ct[player, cell, 0] = 1
+    d0 = ct[player, cell, 1]
+    levels = ct[player, cell, 2]
+    cost = ip[IP_COMBO_COST]
+    best = 0
+    for j in range(min(walls, levels)):
+        val = (ct[player, cell, 3 + j] - d0) * _STEP - (j + 1) * cost
+        if val > best:
+            best = val
+    if best <= 0:
+        return 0
+    best -= (d_now - d0) * _STEP
+    return best if best > 0 else 0
+
+
+@njit(cache=True)
+def _reserve_threat(own, other, reserve):
+    """eval._reserve_threat (RESERVE_SHARE = 4, 2, 1 quarters)."""
+    if own == 0:
+        return reserve * 4 * other // 4
+    if own == 1:
+        return reserve * 2 * other // 4
+    if own == 2:
+        return reserve * other // 4
+    return 0
+
+
+@njit(cache=True)
+def _eval(m, hb, vb, cme, cop, wm, wo, me, d_me, d_op, ip, ct, rm, ll, lh, seen, ck, cv):
+    """Searcher.evaluate for the side to move `me` (pawn on cme, the opponent on cop)."""
+    op = 1 - me
+    ww = ip[IP_WALL_WEIGHT]
+    score = _STEP * (d_op - d_me) + ww * (wm - wo)
+    if ip[IP_V4] == 0:  # eval.evaluate_dists
+        if wo == 0 and d_me <= d_op:
+            score += _RACE
+        elif wm == 0 and d_op < d_me:
+            score -= _RACE
+        return score
+    e_me = d_me
+    e_op = d_op
+    if (wm == 0) != (wo == 0) and ((d_op < d_me) if wm else (d_me <= d_op)):
+        mg = ip[IP_RACE_MIN_GAIN]
+        if wo:  # only the opponent (A) has walls: its plan against us (B)
+            used, db = _wall_race(m, hb, vb, cme, me, wo, mg, ll, lh, seen, ck, cv)
+            e_op = d_op + used
+            e_me = db
+        else:
+            used, db = _wall_race(m, hb, vb, cop, op, wm, mg, ll, lh, seen, ck, cv)
+            e_me = d_me + used
+            e_op = db
+    # eval.evaluate_v4
+    plan = ip[IP_RACE_PLAN]
+    soft = ip[IP_RACE_SOFT]
+    reserve = ip[IP_RESERVE]
+    if reserve:
+        score += _reserve_threat(wo, wm, reserve) - _reserve_threat(wm, wo, reserve)
+    if wo == 0:
+        if d_me <= d_op:
+            score += _RACE
+        elif wm == 0:
+            score -= _RACE
+        else:
+            score += plan * ((e_op - d_op) - (e_me - d_me))
+            if e_me <= e_op:
+                score += soft
+    elif wm == 0:
+        if d_op < d_me:
+            score -= _RACE
+        else:
+            score -= plan * ((e_me - d_me) - (e_op - d_op))
+            if e_op < e_me:
+                score -= soft
+    # the terms Searcher.evaluate adds after evaluate_v4 (only while both have walls)
+    if ip[IP_THREAT] and wm and wo:
+        d1, nb1, _, f1 = _race_best_c(m, hb, vb, cop, op, ll, lh, seen, ck, cv)
+        g_me = nb1 - d1 if f1 else 0
+        d2, nb2, _, f2 = _race_best_c(m, hb, vb, cme, me, ll, lh, seen, ck, cv)
+        g_op = nb2 - d2 if f2 else 0
+        score += ip[IP_THREAT] * (g_me - g_op)
+    if ip[IP_COMBO] and wm and wo:
+        mine = _potential(ct, rm, cop, op, wm, d_op, ip)
+        theirs = _potential(ct, rm, cme, me, wo, d_me, ip)
+        score += ip[IP_COMBO] * (mine - theirs) // _STEP
+    return score
+
+
+@njit(cache=True)
+def _path_s(m, start, player, out, parent, queue):
+    """_path with caller-owned scratch arrays (no allocation)."""
+    goal = N - 1 if player == 0 else 0
+    if start // N == goal:
+        out[0] = start
+        return 1
+    parent[:] = -2
+    parent[start] = -1
+    queue[0] = start
+    head = 0
+    tail = 1
+    while head < tail:
+        i = queue[head]
+        head += 1
+        for d in range(4):
+            if not _bit(m[2 * d], m[2 * d + 1], i):
+                continue
+            if d == 0:
+                j = i + N
+            elif d == 1:
+                j = i - N
+            elif d == 2:
+                j = i + 1
+            else:
+                j = i - 1
+            if parent[j] != -2:
+                continue
+            parent[j] = i
+            if j // N == goal:
+                n = 0
+                while j >= 0:
+                    out[n] = j
+                    n += 1
+                    j = parent[j]
+                for a in range(n // 2):
+                    t = out[a]
+                    out[a] = out[n - 1 - a]
+                    out[n - 1 - a] = t
+                return n
+            queue[tail] = j
+            tail += 1
+    return 0
+
+
+@njit(cache=True)
+def _dir(a, b):
+    if b == a + N:
+        return 0
+    if b == a - N:
+        return 1
+    if b == a + 1:
+        return 2
+    return 3
+
+
+@njit(cache=True)
+def _cand_walls(m, hb, vb, cme, cop, me, d_me, limit, gains, walls, path, parent, queue, seen):
+    """cand_walls into gains / walls (best gain first, stable); returns their number."""
+    op = 1 - me
+    plen = _path_s(m, cop, op, path, parent, queue)
+    if plen == 0:
+        return 0
+    d_op = plen - 1
+    sl, sh = _cell(cop)
+    msl, msh = _cell(cme)
+    seen[:] = False
+    cnt = 0
+    for i in range(plen - 1):
+        a = path[i]
+        d = _dir(a, path[i + 1])
+        for t in range(2):
+            w = EW[d, a, t]
+            if w < 0 or seen[w]:
+                continue
+            seen[w] = True
+            if _occupied(hb, vb, w):
+                continue
+            cm = _with_wall(m, w)
+            op_after = _dist(cm, sl, sh, GOAL[op, 0], GOAL[op, 1])
+            if op_after == NO_DIST or op_after <= d_op:
+                continue
+            me_after = _dist(cm, msl, msh, GOAL[me, 0], GOAL[me, 1])
+            if me_after == NO_DIST:
+                continue
+            gain = (op_after - d_op) - (me_after - d_me)
+            if gain <= 0:
+                continue
+            pos = cnt
+            while pos > 0 and gains[pos - 1] < gain:
+                gains[pos] = gains[pos - 1]
+                walls[pos] = walls[pos - 1]
+                pos -= 1
+            gains[pos] = gain
+            walls[pos] = w
+            cnt += 1
+    n = 0
+    for i in range(cnt):
+        if not _fits(hb, vb, walls[i]):
+            continue
+        gains[n] = gains[i]
+        walls[n] = walls[i]
+        n += 1
+        if n >= limit:  # checked after the append, as in the Python code
+            break
+    return n
+
+
+@njit(cache=True)
+def _saving(m, hb, vb, cme, cop, me, d_me, d_op, gains, walls, seen, tmp, tmp2):
+    """Searcher._saving_walls into gains / walls (best gain first, stable)."""
+    op = 1 - me
+    g = _goal(op)
+    k = _pawn_moves(m, cop, cme, tmp)
+    ea = np.empty(16, dtype=np.int64)
+    eb = np.empty(16, dtype=np.int64)
+    ne = 0
+    for i in range(k):
+        t = tmp[i]
+        if t // N != g:
+            continue
+        if abs(t % N - cop % N) + abs(t // N - cop // N) == 1:
+            ea[ne] = cop
+            eb[ne] = t
+            ne += 1
+        else:  # straight jump or diagonal over our pawn
+            ea[ne] = cop
+            eb[ne] = cme
+            ea[ne + 1] = cme
+            eb[ne + 1] = t
+            ne += 2
+    seen[:] = False
+    cnt = 0
+    for q in range(ne):
+        a = ea[q]
+        d = _dir(a, eb[q])
+        for t in range(2):
+            w = EW[d, a, t]
+            if w < 0 or seen[w]:
+                continue
+            seen[w] = True
+            if not _fits(hb, vb, w):
+                continue
+            cm = _with_wall(m, w)
+            if _wins_now(cm, cop, cme, op, tmp2):
+                continue  # the opponent still wins at once
+            op_after = _dist_cell(cm, cop, op)
+            me_after = _dist_cell(cm, cme, me)
+            if op_after == NO_DIST or me_after == NO_DIST:
+                continue
+            gain = (op_after - d_op) - (me_after - d_me)
+            pos = cnt
+            while pos > 0 and gains[pos - 1] < gain:
+                gains[pos] = gains[pos - 1]
+                walls[pos] = walls[pos - 1]
+                pos -= 1
+            gains[pos] = gain
+            walls[pos] = w
+            cnt += 1
+    return cnt
+
+
+@njit(cache=True)
+def _finish(node, cnt, mv, lg, order, ex, rng, ne0, nne, emv, epr, ekid, ctr):
+    """mcts.MCTS._finish_expand: seeded shuffle, stable sort by logit (best first),
+    softmax priors, the edges written after the last ones."""
+    for i in range(cnt):
+        order[i] = i
+    for i in range(cnt - 1, 0, -1):
+        j = np.int64(_rand(rng) % _U(i + 1))
+        t = order[i]
+        order[i] = order[j]
+        order[j] = t
+    for i in range(1, cnt):
+        x = order[i]
+        k = i - 1
+        while k >= 0 and lg[order[k]] < lg[x]:
+            order[k + 1] = order[k]
+            k -= 1
+        order[k + 1] = x
+    start = ctr[1]
+    ne0[node] = start
+    nne[node] = cnt
+    if cnt == 0:
+        return
+    top = lg[order[0]]
+    tot = 0.0
+    for i in range(cnt):
+        e = math.exp(lg[order[i]] - top)
+        ex[i] = e
+        tot += e
+    for i in range(cnt):
+        emv[start + i] = mv[order[i]]
+        epr[start + i] = ex[i] / tot
+        ekid[start + i] = -1
+    ctr[1] = start + cnt
+
+
+@njit(cache=True)
+def _select(node, nn, nw, npv, ne0, nne, epr, ekid, c_puct, fpu_c, pen, use_pen):
+    """mcts.MCTS._select: PUCT with FPU; children proven won for the opponent are
+    skipped; -1 if every child is."""
+    n = nn[node]
+    sq = c_puct * math.sqrt(n)
+    fpu = nw[node] / n - fpu_c if n else 0.0
+    best_i = -1
+    best = -1.0e300
+    e0 = ne0[node]
+    for i in range(nne[node]):
+        e = e0 + i
+        k = ekid[e]
+        if k < 0 or nn[k] == 0:
+            q = fpu
+            kn = 0
+        else:
+            if npv[k] == 1:
+                continue
+            q = -nw[k] / nn[k]
+            kn = nn[k]
+        if use_pen:
+            q -= pen[i]
+        u = q + sq * epr[e] / (1 + kn)
+        if u > best:
+            best = u
+            best_i = i
+    return best_i
+
+
+@njit(cache=True)
+def mcts_run(
+    nn, nw, npv, ne0, nne, emv, epr, ekid, ctr, rng,
+    root, rm, rhb, rvb, rpawn, rwl, rturn, fp, ip, pen, use_pen, ct, ck, cv, nsims, done0,
+):  # fmt: skip
+    """Up to nsims simulations of mcts.MCTS._simulate from node `root` (position: masks rm,
+    wall sets rhb / rvb, pawns rpawn, walls left rwl, side to move rturn). ctr = [nodes,
+    edges, deepest path]; rng = [splitmix state]; pen = root penalties (use_pen); ct = the
+    combination memo of the root walls; ck / cv = the
+    _race_best / _wall_race memo (kept between searches); done0 = simulations of this search so far.
+    Returns (simulations run, ST_*)."""
+    pawns = np.empty(8, dtype=np.int64)
+    tmp = np.empty(8, dtype=np.int64)
+    tmp2 = np.empty(8, dtype=np.int64)
+    mv = np.empty(MAX_MOVES, dtype=np.int64)
+    lg = np.empty(MAX_MOVES, dtype=np.float64)
+    order = np.empty(MAX_MOVES, dtype=np.int64)
+    ex = np.empty(MAX_MOVES, dtype=np.float64)
+    gains = np.empty(MAX_MOVES, dtype=np.int64)
+    walls = np.empty(MAX_MOVES, dtype=np.int64)
+    path = np.empty(82, dtype=np.int64)
+    parent = np.empty(81, dtype=np.int64)
+    queue = np.empty(81, dtype=np.int64)
+    seen = np.zeros(128, dtype=np.bool_)
+    ll = np.empty(82, dtype=np.uint64)
+    lh = np.empty(82, dtype=np.uint64)
+    stack = np.empty(MAX_PATH, dtype=np.int64)
+    ncap = nn.size
+    ecap = emv.size
+    c_puct = fp[FP_C_PUCT]
+    fpu_c = fp[FP_FPU]
+    status = ST_DONE
+    it = 0
+    while it < nsims:
+        if npv[root] != 0:
+            status = ST_PROVEN
+            break
+        if nne[root] == 1 and done0 + it >= 2:
+            status = ST_ONE
+            break
+        if ctr[0] + 2 > ncap or ctr[1] + MAX_MOVES > ecap:
+            status = ST_FULL
+            break
+        m = (rm[0], rm[1], rm[2], rm[3], rm[4], rm[5], rm[6], rm[7])
+        hb = rhb
+        vb = rvb
+        p0 = rpawn[0]
+        p1 = rpawn[1]
+        w0 = rwl[0]
+        w1 = rwl[1]
+        turn = rturn
+        node = root
+        stack[0] = root
+        plen = 1
+        while ne0[node] >= 0 and npv[node] == 0:
+            i = _select(node, nn, nw, npv, ne0, nne, epr, ekid, c_puct, fpu_c, pen,
+                        use_pen and node == root)  # fmt: skip
+            if i < 0:  # every child loses: proven lost
+                npv[node] = -1
+                break
+            e = ne0[node] + i
+            code = emv[e]
+            if code < WALL_MOVE:
+                if turn == 0:
+                    p0 = code
+                else:
+                    p1 = code
+            else:
+                m, hb, vb = _place(m, hb, vb, code - WALL_MOVE)
+                if turn == 0:
+                    w0 -= 1
+                else:
+                    w1 -= 1
+            turn = 1 - turn
+            kid = ekid[e]
+            if kid < 0:
+                kid = ctr[0]
+                ctr[0] = kid + 1
+                nn[kid] = 0
+                nw[kid] = 0.0
+                npv[kid] = 0
+                ne0[kid] = -1
+                nne[kid] = 0
+                ekid[e] = kid
+            node = kid
+            stack[plen] = node
+            plen += 1
+            if nn[kid] == 0 or plen >= MAX_PATH:
+                break
+        if plen - 1 > ctr[2]:
+            ctr[2] = plen - 1
+        leaf = node
+        if npv[leaf] != 0:
+            v = float(npv[leaf])
+        elif ne0[leaf] >= 0:  # stopped at MAX_PATH on an expanded node: its mean value
+            v = nw[leaf] / nn[leaf]
+        else:
+            me = turn
+            cme = p0 if me == 0 else p1
+            cop = p1 if me == 0 else p0
+            wm = w0 if me == 0 else w1
+            wo = w1 if me == 0 else w0
+            if cop // N == _goal(1 - me):  # rules.winner: the previous mover arrived
+                npv[leaf] = -1
+                v = -1.0
+            else:
+                k = _pawn_moves(m, cme, cop, pawns)
+                g = _goal(me)
+                win = False
+                for t in range(k):
+                    if pawns[t] // N == g:
+                        win = True
+                        break
+                if win:
+                    npv[leaf] = 1
+                    v = 1.0
+                else:
+                    d_me = _dist_cell(m, cme, me)
+                    d_op = _dist_cell(m, cop, 1 - me)
+                    sc = _eval(m, hb, vb, cme, cop, wm, wo, me, d_me, d_op, ip, ct, rm,
+                               ll, lh, seen, ck, cv)  # fmt: skip
+                    v = math.tanh((sc + fp[FP_TEMPO]) / fp[FP_SCALE])
+                    # expansion (MCTS._expand_lists of an inner node)
+                    op = 1 - me
+                    saving = wm > 0 and _wins_now(m, cop, cme, op, tmp)
+                    cnt = 0
+                    for t in range(k):
+                        d = _dist_cell(m, pawns[t], me)
+                        mv[cnt] = pawns[t]
+                        lg[cnt] = fp[FP_PAWN] * (d_me - d)
+                        cnt += 1
+                    base = fp[FP_WALL] + (fp[FP_BEHIND] if d_me > d_op else 0.0)
+                    if saving:
+                        base += fp[FP_SAVING]
+                    if wm > 0:
+                        if saving:
+                            nwl = _saving(m, hb, vb, cme, cop, me, d_me, d_op, gains, walls,
+                                          seen, tmp, tmp2)  # fmt: skip
+                        else:
+                            nwl = _cand_walls(m, hb, vb, cme, cop, me, d_me,
+                                              ip[IP_WALL_LIMIT], gains, walls, path,
+                                              parent, queue, seen)  # fmt: skip
+                        for t in range(nwl):
+                            mv[cnt] = WALL_MOVE + walls[t]
+                            lg[cnt] = base + fp[FP_GAIN] * gains[t]
+                            cnt += 1
+                    _finish(leaf, cnt, mv, lg, order, ex, rng, ne0, nne, emv, epr, ekid, ctr)
+        # backup (values for each node's side to move) and proof propagation
+        child_proven = npv[leaf]
+        for t in range(plen - 1, -1, -1):
+            nd = stack[t]
+            nn[nd] += 1
+            nw[nd] += v
+            v = -v
+            if t != plen - 1 and npv[nd] == 0 and child_proven != 0:
+                if child_proven == -1:
+                    npv[nd] = 1
+                else:
+                    every = True
+                    e0 = ne0[nd]
+                    for i in range(nne[nd]):
+                        kk = ekid[e0 + i]
+                        if kk < 0 or npv[kk] != 1:
+                            every = False
+                            break
+                    if every:
+                        npv[nd] = -1
+            child_proven = npv[nd]
+        it += 1
+    return it, status
+
+
+@njit(cache=True)
+def mcts_pv(node, nn, ne0, nne, ekid):
+    """mcts.MCTS._pv_len: length of the most visited line from `node` (at least 1)."""
+    d = 0
+    while ne0[node] >= 0 and nn[node] > 1:
+        best = -1
+        bn = -1
+        e0 = ne0[node]
+        for i in range(nne[node]):
+            k = ekid[e0 + i]
+            if k >= 0 and (best < 0 or nn[k] > bn):
+                best = k
+                bn = nn[k]
+        if best < 0:
+            break
+        d += 1
+        node = best
+    return max(1, d)
+
+
+@njit(cache=True)
+def mcts_count(root, ne0, nne, ekid):
+    """(nodes, edges) of the subtree of `root`."""
+    stack = np.empty(1024, dtype=np.int64)
+    stack[0] = root
+    top = 1
+    nodes = 0
+    edges = 0
+    while top > 0:
+        top -= 1
+        x = stack[top]
+        nodes += 1
+        if ne0[x] < 0:
+            continue
+        edges += nne[x]
+        for i in range(nne[x]):
+            k = ekid[ne0[x] + i]
+            if k >= 0:
+                if top >= stack.size:
+                    bigger = np.empty(stack.size * 2, dtype=np.int64)
+                    bigger[:top] = stack[:top]
+                    stack = bigger
+                stack[top] = k
+                top += 1
+    return nodes, edges
+
+
+@njit(cache=True)
+def mcts_compact(
+    root, nn, nw, npv, ne0, nne, emv, epr, ekid, dn, dw, dp, de0, dne, dmv, dpr, dkid,
+):  # fmt: skip
+    """Copy the subtree of `root` into the d* arrays (root -> node 0, breadth first);
+    returns (nodes, edges)."""
+    queue = np.empty(dn.size, dtype=np.int64)
+    queue[0] = root
+    head = 0
+    tail = 1
+    edges = 0
+    while head < tail:
+        x = queue[head]
+        y = head
+        head += 1
+        dn[y] = nn[x]
+        dw[y] = nw[x]
+        dp[y] = npv[x]
+        if ne0[x] < 0:
+            de0[y] = -1
+            dne[y] = 0
+            continue
+        de0[y] = edges
+        dne[y] = nne[x]
+        e0 = ne0[x]
+        for i in range(nne[x]):
+            dmv[edges + i] = emv[e0 + i]
+            dpr[edges + i] = epr[e0 + i]
+            k = ekid[e0 + i]
+            if k >= 0:
+                queue[tail] = k
+                dkid[edges + i] = tail
+                tail += 1
+            else:
+                dkid[edges + i] = -1
+        edges += nne[x]
+    return tail, edges
