@@ -17,6 +17,9 @@
   alpha-beta (Searcher._negamax) of that depth instead of the static eval; rollout > 0:
   that many plies of the greedy policy (shortest-path step or the best wall if it gains
   at least 2) before the eval.
+* expand_visits = 2 (report 0083): a new leaf is only evaluated (and checked for a win in
+  one); its moves are generated on its second visit, which then descends into a child.
+  Most leaves are visited once, so this saves their move generation.
 * Proven results: a side that can step onto its goal row wins (the node is not
   expanded); a node with a winning child is won, a node whose children all lose is lost
   (over the pruned move set, as in alpha-beta).
@@ -79,6 +82,7 @@ MCTS_DEFAULTS: dict[str, float] = {
     "rollout": 0,
     "tree_defense": 0,
     "rep_penalty": 0.0,
+    "expand_visits": 1,  # 2: a leaf is evaluated on its first visit, expanded on the second
 }
 CORES = ("jit", "py")
 
@@ -260,6 +264,9 @@ class MCTS:
         self.rollout = int(o["rollout"])
         self.tree_defense = int(o["tree_defense"])
         self.rep_penalty = float(o["rep_penalty"])
+        self.expand_visits = int(o["expand_visits"])
+        if self.expand_visits not in (1, 2):
+            raise ValueError("MCTS: expand_visits must be 1 or 2")
         settings = dict(searcher_settings or {})
         settings["tt_bits"] = 0  # small alpha-beta at the leaves only: no table
         self.s = Searcher(seed, **settings)
@@ -275,6 +282,7 @@ class MCTS:
         self._jkid_states: list[GameState] = []
         self._pen: list[float] | None = None  # root penalties of the last search
         self._memo: tuple | None = None  # jit: the _race_best / _wall_race memo (kept)
+        self._keep_on_cancel = False
         why = self._jit_unsupported()
         if core == "jit" and why:
             raise ValueError(f"MCTS: the jit core is not available ({why})")
@@ -463,7 +471,13 @@ class MCTS:
     def _simulate(self, root: _Node, pen: list[float] | None) -> None:
         node = root
         path = [root]
-        while node.moves is not None and node.proven == 0:
+        lazy = self.expand_visits >= 2
+        while node.proven == 0:
+            if node.moves is None:
+                if not lazy or node.n == 0:
+                    break  # a new leaf
+                # expand_visits = 2: the second visit expands the leaf, then descends
+                self._expand(node, pawn_moves(node.state), False)
             i = self._select(node, pen if node is root else None)
             if i < 0:  # every child loses: proven lost
                 node.proven = -1
@@ -492,7 +506,8 @@ class MCTS:
                     v = 1.0
                 else:
                     v = self._rollout_value(state) if self.rollout else self._static(state)
-                    self._expand(node, pawns, node is root)
+                    if not lazy or node.n > 0:
+                        self._expand(node, pawns, node is root)
         # backpropagation (values for each node's side to move) and proof propagation
         child_proven = node.proven
         for nd in reversed(path):
@@ -536,7 +551,8 @@ class MCTS:
             if deadline is not None and done and time.perf_counter() >= deadline:
                 break
             if should_stop is not None and should_stop():
-                self._root = None
+                if not self._keep_on_cancel:
+                    self._root = None
                 raise MCTSCancelled(done)
             self._simulate(root, pen)
             done += 1
@@ -655,6 +671,7 @@ class MCTS:
         ip[_K.IP_RACE_SOFT] = s.race_soft
         ip[_K.IP_RACE_MIN_GAIN] = s.race_min_gain
         ip[_K.IP_WALL_LIMIT] = s.wall_limit
+        ip[_K.IP_EXPAND] = self.expand_visits
         fp = np.zeros(_K.FP_SIZE, dtype=np.float64)
         fp[_K.FP_C_PUCT] = self.c_puct
         fp[_K.FP_SCALE] = self.scale
@@ -704,7 +721,8 @@ class MCTS:
             if deadline is not None and done and now >= deadline:
                 break
             if should_stop is not None and should_stop():
-                self._jstate = None
+                if not self._keep_on_cancel:
+                    self._jstate = None
                 raise MCTSCancelled(done)
             if on_progress is not None and done and now - last >= every:
                 last = now
@@ -763,13 +781,16 @@ class MCTS:
         should_stop: Callable[[], bool] | None = None,
         on_progress: Callable[[int, int], None] | None = None,
         progress_every: float = PROGRESS_EVERY,
+        keep_on_cancel: bool = False,
     ) -> MCTSResult:
         """Search `state` for `sims` simulations and/or `time_limit` seconds.
 
         should_stop(): checked between simulations (jit: between batches of a few ms);
-        True raises MCTSCancelled (the tree is dropped). on_progress(line, sims): called
-        at most every `progress_every` seconds with the length of the most visited line
-        and the simulations so far. After the search root_children() describes the root."""
+        True raises MCTSCancelled; the tree is dropped unless keep_on_cancel (it is cut
+        between simulations, so it stays consistent and the next search may reuse it).
+        on_progress(line, sims): called at most every `progress_every` seconds with the
+        length of the most visited line and the simulations so far. After the search
+        root_children() describes the root."""
         if winner(state) is not None:
             raise ValueError("no legal moves (terminal position)")
         if sims is None and time_limit is None:
@@ -786,6 +807,7 @@ class MCTS:
                 return MCTSResult(p, PROVEN_SCORE, 1, 1, time.perf_counter() - t0, 1, 1)
         s = self.s
         s._reset(state)
+        self._keep_on_cancel = keep_on_cancel
         try:
             self._max_depth = 0
             deadline = None if time_limit is None else t0 + time_limit

@@ -33,6 +33,11 @@ def test_registry():
     assert make_bot("mcts", 0).sims is not None
     assert make_bot("mcts-3s", 0).move_time == 3.0
     assert make_bot("mcts-0.2s", 0).move_time == 0.2
+    # MCTS2 (report 0083): lazy expansion and the strong repetition penalty
+    assert {"mcts2", "mcts2-clock", "mcts2-0.2s", "mcts2-3s"} <= set(BOTS)
+    m2 = make_bot("mcts2-3s", 0)
+    assert m2.move_time == 3.0 and m2.mcts.expand_visits == 2 and m2.mcts.rep_penalty == 1.0
+    assert make_bot("mcts2", 0).sims is not None and make_bot("mcts2-clock", 0).game_time
 
 
 def test_bad_arguments():
@@ -269,3 +274,48 @@ def test_jit_equals_python_with_history_reuse_and_growth(monkeypatch):
     jg, pg = game("jit"), game("py")
     assert jg == pg
     assert any(v > 150 for _, _, v, _ in jg)  # some trees were reused
+
+
+# ---------- step 4 (report 0083): lazy expansion, kept tree after a cancel ----------
+
+
+@needs_jit
+def test_jit_equals_python_with_lazy_expansion():
+    ps = positions([75, 76], every=6, max_plies=90, wall_bias=0.75)
+    assert len(ps) >= 20
+    for i, s in enumerate(ps):
+        a, b = _both(s, 300, seed=i, expand_visits=2)
+        assert a == b, (i, s)
+    for s in (state((4, 7), (0, 4), BLACK), state((4, 3), (4, 5), WHITE, walls=(0, 6))):
+        a, b = _both(s, 400, seed=3, expand_visits=2)
+        assert a == b, s
+
+
+@pytest.mark.parametrize("core", CORES)
+def test_lazy_expansion_expands_only_revisited_leaves(core):
+    m = mcts(core=core, expand_visits=2)
+    r = m.search(GameState.initial(), sims=400)
+    expanded = sum(1 for _ in m._iter_tree())
+    eager = mcts(core=core)
+    eager.search(GameState.initial(), sims=400)
+    assert expanded < sum(1 for _ in eager._iter_tree())
+    assert r.visits == 401 and is_legal_move(GameState.initial(), r.move)
+    with pytest.raises(ValueError):
+        mcts(core=core, expand_visits=3)
+
+
+@pytest.mark.parametrize("core", CORES)
+def test_keep_on_cancel_keeps_the_tree_for_the_next_search(core):
+    s = GameState.initial()
+    for keep in (False, True):
+        m = mcts(core=core)
+        m.search(s, sims=200)
+
+        def stop(n=[0]):  # noqa: B006 (a call counter)
+            n[0] += 1
+            return n[0] > 2
+
+        with pytest.raises(MCTSCancelled):
+            m.search(s, time_limit=5.0, should_stop=stop, keep_on_cancel=keep)
+        r = m.search(s, sims=50)
+        assert (r.visits > 251) == keep, keep

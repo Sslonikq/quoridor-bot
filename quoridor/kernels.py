@@ -790,7 +790,8 @@ IP_RACE_PLAN = 9
 IP_RACE_SOFT = 10
 IP_RACE_MIN_GAIN = 11
 IP_WALL_LIMIT = 12
-IP_SIZE = 13
+IP_EXPAND = 13  # mcts expand_visits: a leaf is expanded on its visit number this (1 or 2)
+IP_SIZE = 14
 
 FP_C_PUCT = 0
 FP_SCALE = 1
@@ -1369,6 +1370,36 @@ def _select(node, nn, nw, npv, ne0, nne, epr, ekid, c_puct, fpu_c, pen, use_pen)
 
 
 @njit(cache=True)
+def _expand(node, m, hb, vb, cme, cop, wm, me, d_me, d_op, k, pawns, fp, ip, mv, lg, order, ex,
+            gains, walls, path, parent, queue, seen, tmp, tmp2, rng, ne0, nne, emv, epr, ekid,
+            ctr):  # fmt: skip
+    """mcts.MCTS._expand_lists of an inner node (k pawn moves in `pawns`): pawn moves, then
+    the candidate (or saving) walls; the edges are written by _finish."""
+    op = 1 - me
+    saving = wm > 0 and _wins_now(m, cop, cme, op, tmp)
+    cnt = 0
+    for t in range(k):
+        d = _dist_cell(m, pawns[t], me)
+        mv[cnt] = pawns[t]
+        lg[cnt] = fp[FP_PAWN] * (d_me - d)
+        cnt += 1
+    base = fp[FP_WALL] + (fp[FP_BEHIND] if d_me > d_op else 0.0)
+    if saving:
+        base += fp[FP_SAVING]
+    if wm > 0:
+        if saving:
+            nwl = _saving(m, hb, vb, cme, cop, me, d_me, d_op, gains, walls, seen, tmp, tmp2)
+        else:
+            nwl = _cand_walls(m, hb, vb, cme, cop, me, d_me, ip[IP_WALL_LIMIT], gains, walls,
+                              path, parent, queue, seen)  # fmt: skip
+        for t in range(nwl):
+            mv[cnt] = WALL_MOVE + walls[t]
+            lg[cnt] = base + fp[FP_GAIN] * gains[t]
+            cnt += 1
+    _finish(node, cnt, mv, lg, order, ex, rng, ne0, nne, emv, epr, ekid, ctr)
+
+
+@njit(cache=True)
 def mcts_run(
     nn, nw, npv, ne0, nne, emv, epr, ekid, ctr, rng,
     root, rm, rhb, rvb, rpawn, rwl, rturn, fp, ip, pen, use_pen, ct, ck, cv, nsims, done0,
@@ -1399,6 +1430,7 @@ def mcts_run(
     ecap = emv.size
     c_puct = fp[FP_C_PUCT]
     fpu_c = fp[FP_FPU]
+    lazy = 1 if ip[IP_EXPAND] >= 2 else 0
     status = ST_DONE
     it = 0
     while it < nsims:
@@ -1422,7 +1454,21 @@ def mcts_run(
         node = root
         stack[0] = root
         plen = 1
-        while ne0[node] >= 0 and npv[node] == 0:
+        while npv[node] == 0:
+            if ne0[node] < 0:
+                if lazy == 0 or nn[node] == 0:
+                    break  # a new leaf
+                # expand_visits = 2: the second visit of a leaf expands it, then descends
+                me = turn
+                cme = p0 if me == 0 else p1
+                cop = p1 if me == 0 else p0
+                k = _pawn_moves(m, cme, cop, pawns)
+                d_me = _dist_cell(m, cme, me)
+                d_op = _dist_cell(m, cop, 1 - me)
+                wm = w0 if me == 0 else w1
+                _expand(node, m, hb, vb, cme, cop, wm, me, d_me, d_op, k,
+                        pawns, fp, ip, mv, lg, order, ex, gains, walls, path, parent, queue,
+                        seen, tmp, tmp2, rng, ne0, nne, emv, epr, ekid, ctr)  # fmt: skip
             i = _select(node, nn, nw, npv, ne0, nne, epr, ekid, c_puct, fpu_c, pen,
                         use_pen and node == root)  # fmt: skip
             if i < 0:  # every child loses: proven lost
@@ -1490,31 +1536,10 @@ def mcts_run(
                     sc = _eval(m, hb, vb, cme, cop, wm, wo, me, d_me, d_op, ip, ct, rm,
                                ll, lh, seen, ck, cv)  # fmt: skip
                     v = math.tanh((sc + fp[FP_TEMPO]) / fp[FP_SCALE])
-                    # expansion (MCTS._expand_lists of an inner node)
-                    op = 1 - me
-                    saving = wm > 0 and _wins_now(m, cop, cme, op, tmp)
-                    cnt = 0
-                    for t in range(k):
-                        d = _dist_cell(m, pawns[t], me)
-                        mv[cnt] = pawns[t]
-                        lg[cnt] = fp[FP_PAWN] * (d_me - d)
-                        cnt += 1
-                    base = fp[FP_WALL] + (fp[FP_BEHIND] if d_me > d_op else 0.0)
-                    if saving:
-                        base += fp[FP_SAVING]
-                    if wm > 0:
-                        if saving:
-                            nwl = _saving(m, hb, vb, cme, cop, me, d_me, d_op, gains, walls,
-                                          seen, tmp, tmp2)  # fmt: skip
-                        else:
-                            nwl = _cand_walls(m, hb, vb, cme, cop, me, d_me,
-                                              ip[IP_WALL_LIMIT], gains, walls, path,
-                                              parent, queue, seen)  # fmt: skip
-                        for t in range(nwl):
-                            mv[cnt] = WALL_MOVE + walls[t]
-                            lg[cnt] = base + fp[FP_GAIN] * gains[t]
-                            cnt += 1
-                    _finish(leaf, cnt, mv, lg, order, ex, rng, ne0, nne, emv, epr, ekid, ctr)
+                    if lazy == 0 or nn[leaf] > 0:
+                        _expand(leaf, m, hb, vb, cme, cop, wm, me, d_me, d_op, k, pawns, fp, ip,
+                                mv, lg, order, ex, gains, walls, path, parent, queue, seen,
+                                tmp, tmp2, rng, ne0, nne, emv, epr, ekid, ctr)  # fmt: skip
         # backup (values for each node's side to move) and proof propagation
         child_proven = npv[leaf]
         for t in range(plen - 1, -1, -1):

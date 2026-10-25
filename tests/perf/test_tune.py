@@ -63,6 +63,10 @@ def test_parse_spec_v4_v5_and_mcts():
     assert b.move_time == 1.0 and b._searcher.combo == V5_SETTINGS["combo"]
     b = tune.parse_spec("mcts:c_puct=2.0", 0.3)(0)
     assert isinstance(b, MCTSBot) and b.move_time == 0.3 and b._mcts.c_puct == 2.0
+    b = tune.parse_spec("mcts:s_combo=40,s_wall_limit=7,c_puct=1.0", 0.3)(0)
+    assert b._mcts.s.combo == 40 and b._mcts.s.wall_limit == 7 and b._mcts.c_puct == 1.0
+    b = tune.parse_spec("mcts2:move_time=10.0", 0.3)(0)
+    assert b.move_time == 10.0 and b._mcts.expand_visits == 2 and b._mcts.rep_penalty == 1.0
     b = tune.parse_spec("mcts:sims=50", 0.3)(0)
     assert b.sims == 50 and b.move_time is None
     assert tune.uses_default_move_time("mcts:") and not tune.uses_default_move_time("mcts:sims=5")

@@ -505,6 +505,36 @@ def make_mcts_match(seed: int) -> MCTSBot:
     return MCTSBot(seed, move_time=MATCH_MOVE_TIME, searcher_settings=MCTS_SEARCHER, **MCTS_OPTIONS)
 
 
+# MCTS2 (phase 9, step 4, report 0083): the MCTS with lazy expansion (a leaf gets its
+# moves on its second visit: x1.3-1.5 simulations per second, half the edge memory) and a
+# strong repetition penalty (game03 21+, game07 26: no walking back into own cells).
+MCTS2_OPTIONS: dict[str, float] = {**MCTS_OPTIONS, "rep_penalty": 1.0, "expand_visits": 2}
+
+
+def _mcts2(seed: int, **limit: float) -> MCTSBot:
+    return MCTSBot(seed, searcher_settings=MCTS_SEARCHER, **limit, **MCTS2_OPTIONS)  # type: ignore[arg-type]
+
+
+def make_mcts2(seed: int) -> MCTSBot:
+    """MCTS2 with MCTS_SIMS simulations per move (deterministic per seed)."""
+    return _mcts2(seed, sims=MCTS_SIMS)
+
+
+def make_mcts2_clock(seed: int) -> MCTSBot:
+    """MCTS2 on a 10-minute game clock."""
+    return _mcts2(seed, game_time=GAME_TIME)
+
+
+def make_mcts2_fast(seed: int) -> MCTSBot:
+    """MCTS2 with FAST_MOVE_TIME per move."""
+    return _mcts2(seed, move_time=FAST_MOVE_TIME)
+
+
+def make_mcts2_match(seed: int) -> MCTSBot:
+    """MCTS2 with MATCH_MOVE_TIME per move."""
+    return _mcts2(seed, move_time=MATCH_MOVE_TIME)
+
+
 def make_v4_frozen(seed: int) -> SearchBot:
     """v4 exactly as in reports 0061/0062 (quoridor/frozen/search_v4.py), depth V4_DEPTH.
 
@@ -565,6 +595,10 @@ BOTS: dict[str, BotFactory] = {
     "mcts-clock": make_mcts_clock,
     "mcts-0.2s": make_mcts_fast,
     "mcts-3s": make_mcts_match,
+    "mcts2": make_mcts2,
+    "mcts2-clock": make_mcts2_clock,
+    "mcts2-0.2s": make_mcts2_fast,
+    "mcts2-3s": make_mcts2_match,
 }
 # Bots whose play does not depend on the seed in a meaningful way (seed only breaks ties):
 # a mirror match of such a bot repeats the same game.
