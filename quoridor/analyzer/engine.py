@@ -7,6 +7,7 @@ replayed here from the initial position with rules.apply_move (illegal moves are
 from __future__ import annotations
 
 import re
+import threading
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
@@ -144,19 +145,60 @@ def _score_white(state: GameState, score: int) -> int:
     return score if state.turn == 0 else -score
 
 
+# Tree reuse between analyses (report 0083): one MCTS kept between requests. A position
+# equal to the last analysed one, its child or its grandchild (the next move or two typed
+# in, a time mode switch) continues that tree; anything else starts a new one inside
+# MCTS.search. The lock serialises the searches; a request that cannot get it soon (the
+# cancelled older search finishes within a batch of a few ms) searches with its own
+# fresh MCTS.
+_MCTS_LOCK = threading.Lock()
+_MCTS_WAIT = 1.0  # seconds to wait for the shared tree
+_mcts_shared: MCTS | None = None
+
+
+def _new_mcts() -> MCTS:
+    return MCTS(MCTS_SEED, MCTS_SEARCHER, **MCTS_OPTIONS)
+
+
+def reset_mcts_tree() -> None:
+    """Forget the kept MCTS tree (tests; frees its memory)."""
+    global _mcts_shared
+    with _MCTS_LOCK:
+        _mcts_shared = None
+
+
 def _rank_mcts(
     state: GameState,
     budget: float,
     cancelled: Callable[[], bool],
     on_progress: Callable[[int, int], None] | None,
-) -> tuple[list[RankedMove], int, int]:
+) -> tuple[list[RankedMove], int, int, int]:
+    global _mcts_shared
+    if not _MCTS_LOCK.acquire(timeout=_MCTS_WAIT):
+        return _rank_mcts_with(_new_mcts(), state, budget, cancelled, on_progress)
+    try:
+        if _mcts_shared is None:
+            _mcts_shared = _new_mcts()
+        return _rank_mcts_with(_mcts_shared, state, budget, cancelled, on_progress)
+    finally:
+        _MCTS_LOCK.release()
+
+
+def _rank_mcts_with(
+    mcts: MCTS,
+    state: GameState,
+    budget: float,
+    cancelled: Callable[[], bool],
+    on_progress: Callable[[int, int], None] | None,
+) -> tuple[list[RankedMove], int, int, int]:
     """Top moves of the PUCT-MCTS (the bot of bots.make_mcts_*), the whole budget in one
     search: the best move is the bot's choice, the others are the other most visited root
     moves (by visits, then by value; no alternative is shown above the best). Returns
-    (moves, depth, simulations); depth is the length of the most visited line.
-    ([], 0, n) when cancelled. Cancellation is checked between simulation batches (a few
-    ms), progress (line, simulations) is reported at most every PROGRESS_EVERY s."""
-    mcts = MCTS(MCTS_SEED, MCTS_SEARCHER, **MCTS_OPTIONS)
+    (moves, depth, simulations, reused); depth is the length of the most visited line,
+    reused = simulations of the kept tree (see _MCTS_LOCK) the root started with.
+    ([], 0, n, 0) when cancelled (the tree is kept for the next request). Cancellation is
+    checked between simulation batches (a few ms), progress (line, simulations) is
+    reported at most every PROGRESS_EVERY s."""
     try:
         res = mcts.search(
             state,
@@ -165,9 +207,10 @@ def _rank_mcts(
             should_stop=cancelled,
             on_progress=on_progress,
             progress_every=PROGRESS_EVERY,
+            keep_on_cancel=True,
         )
     except MCTSCancelled as e:
-        return [], 0, e.sims
+        return [], 0, e.sims, 0
     best = RankedMove(res.move, res.score, res.depth, True, res.visits)
     ranked = [best]
     rest = [c for c in mcts.root_children() if c.move != res.move and c.visits > 0]
@@ -176,7 +219,7 @@ def _rank_mcts(
         ranked.append(
             RankedMove(c.move, min(c.score, best.score), c.depth, c.score <= best.score, c.visits)
         )
-    return ranked, res.depth, res.nodes
+    return ranked, res.depth, res.nodes, max(0, res.visits - 1 - res.nodes)
 
 
 def rank_moves(
@@ -208,7 +251,7 @@ def rank_moves(
     if bot not in BOTS:
         raise ValueError(f"unknown bot {bot!r}")
     if bot == "mcts":
-        ranked, depth, _ = _rank_mcts(state, budget, cancelled, on_depth)
+        ranked, depth, _, _ = _rank_mcts(state, budget, cancelled, on_depth)
         return ranked, depth
     searcher = _CancellableSearcher(cancelled, V5_SETTINGS if bot == "v5" else None)
     searcher.on_depth = on_depth  # live depth of the main search (completed iterations)
@@ -335,7 +378,8 @@ def analyze(
     (see rank_moves). `on_depth(d)` is called after every completed iteration (live depth).
     `bot` is "v4" | "v5" | "mcts" (ValueError otherwise); the result carries it as "bot".
     For MCTS: depth = length of the main line, `on_depth(d, sims)`, entries have "visits",
-    the result has "sims" (simulations done).
+    the result has "sims" (simulations of this request) and "reused" (simulations of the
+    kept tree from an earlier request on this position, its parent or grandparent).
     """
     if bot not in BOTS:
         raise ValueError(f"unknown bot {bot!r}")
@@ -353,9 +397,9 @@ def analyze(
         }
     seconds = _clamp_time(seconds)
     t0 = time.perf_counter()
-    sims = 0
+    sims = reused = 0
     if bot == "mcts" and not any(m.row == goal_row(state.turn) for m in pawn_moves(state)):
-        ranked, depth, sims = _rank_mcts(state, seconds, cancelled, on_depth)
+        ranked, depth, sims, reused = _rank_mcts(state, seconds, cancelled, on_depth)
     else:
         ranked, depth = rank_moves(state, seconds, cancelled, on_depth, bot)
     if cancelled() or not ranked:
@@ -372,7 +416,7 @@ def analyze(
     return {
         "position": pos,
         "bot": bot,
-        **({"sims": sims} if bot == "mcts" else {}),
+        **({"sims": sims, "reused": reused} if bot == "mcts" else {}),
         "top": top,
         "eval": top[0]["score"],
         "eval_mate": top[0]["mate"],

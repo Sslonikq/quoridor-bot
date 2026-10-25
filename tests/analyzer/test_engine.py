@@ -399,10 +399,36 @@ def test_mcts_analysis_top_moves_are_legal_and_sorted_by_visits():
     assert 1 <= len(top) <= 3 and {t["name"] for t in top} <= legal
     assert len({t["name"] for t in top}) == len(top)
     assert top[0]["visits"] >= max(t["visits"] for t in top[1:] or top)
-    assert res["bot"] == "mcts" and 0 < top[0]["visits"] <= res["sims"] + 1
+    assert res["bot"] == "mcts" and 0 < top[0]["visits"] <= res["sims"] + res["reused"] + 1
     assert res["depth"] == top[0]["depth"] >= 1
     # alternatives are never shown above the best move (side to move: white)
     assert all(t["score"] <= top[0]["score"] for t in top)
+
+
+def test_mcts_tree_is_kept_for_the_next_move_and_after_a_cancel():
+    """Report 0083: the analysis of a child / grandchild of the last analysed position
+    continues its tree, also when the last analysis was cancelled; others start anew."""
+    import time
+
+    from quoridor.analyzer import engine
+
+    engine.reset_mcts_tree()
+    first = engine.analyze(["e2", "e8"], 0.4, bot="mcts")
+    assert first["reused"] == 0 and first["sims"] > 0
+    best = first["top"][0]["name"]
+    again = engine.analyze(["e2", "e8"], 0.2, bot="mcts")  # same position (a time switch)
+    assert again["reused"] >= first["sims"]
+    nxt = engine.analyze(["e2", "e8", best], 0.2, bot="mcts")  # the expected move came
+    assert nxt["reused"] > 0
+    t0 = time.perf_counter()
+    late = lambda: time.perf_counter() - t0 > 0.2  # noqa: E731
+    cut = engine.analyze(["e2", "e8", best], 5, late, None, "mcts")
+    assert cut["cancelled"]
+    after = engine.analyze(["e2", "e8", best], 0.2, bot="mcts")
+    assert after["reused"] > nxt["reused"]  # the cancelled search added to the kept tree
+    other = engine.analyze(["a2h"], 0.2, bot="mcts")  # not below the last root
+    assert other["reused"] == 0
+    engine.reset_mcts_tree()
 
 
 def test_mcts_and_v5_win_on_the_spot_and_report_the_bot():
