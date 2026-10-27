@@ -405,6 +405,18 @@ def test_mcts_analysis_top_moves_are_legal_and_sorted_by_visits():
     assert all(t["score"] <= top[0]["score"] for t in top)
 
 
+def test_mcts_button_uses_mcts2_with_the_endgame_solver():
+    """Report 0084 (the user's decision): the analyzer's MCTS is mcts2 (MCTS2_OPTIONS:
+    lazy expansion, strong repetition penalty, endgame solver at <= 2 walls)."""
+    from quoridor.analyzer import engine
+    from quoridor.bots import MCTS2_OPTIONS
+
+    m = engine._new_mcts()
+    assert m.expand_visits == MCTS2_OPTIONS["expand_visits"] == 2
+    assert m.rep_penalty == MCTS2_OPTIONS["rep_penalty"] == 1.0
+    assert m.solver == MCTS2_OPTIONS["solver"] == 2
+
+
 def test_mcts_tree_is_kept_for_the_next_move_and_after_a_cancel():
     """Report 0083: the analysis of a child / grandchild of the last analysed position
     continues its tree, also when the last analysis was cancelled; others start anew."""

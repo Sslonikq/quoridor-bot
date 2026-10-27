@@ -12,7 +12,8 @@ import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 
-from quoridor.bots import MCTS_OPTIONS, MCTS_SEARCHER, V4_SETTINGS, V5_SETTINGS
+from quoridor.bots import MCTS2_OPTIONS, MCTS_SEARCHER, V4_SETTINGS, V5_SETTINGS
+from quoridor.endgame import mate_text
 from quoridor.eval import WIN
 from quoridor.mcts import MCTS, PROGRESS_EVERY, MCTSCancelled
 from quoridor.notation import format_move, parse_move
@@ -139,6 +140,7 @@ class RankedMove:
     depth: int = 1  # plies from the root at which the score was found
     exact: bool = True  # False: an upper bound (an alternative that was only refuted)
     visits: int = 0  # MCTS only: simulations that went through this root move
+    mate_in: int = 0  # endgame solver: +n wins on ply n, -n loses on ply n (0: not solved)
 
 
 def _score_white(state: GameState, score: int) -> int:
@@ -157,7 +159,7 @@ _mcts_shared: MCTS | None = None
 
 
 def _new_mcts() -> MCTS:
-    return MCTS(MCTS_SEED, MCTS_SEARCHER, **MCTS_OPTIONS)
+    return MCTS(MCTS_SEED, MCTS_SEARCHER, **MCTS2_OPTIONS)  # mcts2 + endgame solver (0084)
 
 
 def reset_mcts_tree() -> None:
@@ -191,14 +193,15 @@ def _rank_mcts_with(
     cancelled: Callable[[], bool],
     on_progress: Callable[[int, int], None] | None,
 ) -> tuple[list[RankedMove], int, int, int]:
-    """Top moves of the PUCT-MCTS (the bot of bots.make_mcts_*), the whole budget in one
-    search: the best move is the bot's choice, the others are the other most visited root
-    moves (by visits, then by value; no alternative is shown above the best). Returns
-    (moves, depth, simulations, reused); depth is the length of the most visited line,
-    reused = simulations of the kept tree (see _MCTS_LOCK) the root started with.
+    """Top moves of the PUCT-MCTS (the bot of bots.make_mcts2_*, report 0084), the whole
+    budget in one search: the best move is the bot's choice, the others are the other
+    most visited root moves (by visits, then by value; no alternative is shown above the
+    best). Returns (moves, depth, simulations, reused); depth is the length of the most
+    visited line, reused = simulations of the kept tree (see _MCTS_LOCK) the root started with.
     ([], 0, n, 0) when cancelled (the tree is kept for the next request). Cancellation is
     checked between simulation batches (a few ms), progress (line, simulations) is
-    reported at most every PROGRESS_EVERY s."""
+    reported at most every PROGRESS_EVERY s. A result proven by the endgame solver (both
+    sides <= 2 walls) is the one move with its mate distance (mate_in), no tree."""
     try:
         res = mcts.search(
             state,
@@ -211,6 +214,9 @@ def _rank_mcts_with(
         )
     except MCTSCancelled as e:
         return [], 0, e.sims, 0
+    if res.solved is not None:  # proven by the endgame solver: no tree, one move
+        solved = RankedMove(res.move, res.score, res.depth, True, 0, res.solved.plies)
+        return [solved], res.depth, 0, 0
     best = RankedMove(res.move, res.score, res.depth, True, res.visits)
     ranked = [best]
     rest = [c for c in mcts.root_children() if c.move != res.move and c.visits > 0]
@@ -353,10 +359,11 @@ def _top_entries(state: GameState, ranked: list[RankedMove]) -> list[dict]:
                 **move_json(r.move),
                 "mate": is_win_score(r.score),
                 "score": _score_white(state, r.score),  # centi-steps, white's view
-                "why": _why(state, r.move, child, r.score),
+                "why": mate_text(r.mate_in) if r.mate_in else _why(state, r.move, child, r.score),
                 "depth": r.depth,  # plies from the position for this score
                 "exact": r.exact,  # False: an upper bound ("not better than")
                 **({"visits": r.visits} if r.visits else {}),  # MCTS: simulations through it
+                **({"mate_in": r.mate_in} if r.mate_in else {}),  # solver: +-plies to the end
             }
         )
     return top
@@ -420,6 +427,7 @@ def analyze(
         "top": top,
         "eval": top[0]["score"],
         "eval_mate": top[0]["mate"],
+        **({"eval_text": top[0]["why"]} if "mate_in" in top[0] else {}),  # "выигрыш за N ходов"
         "depth": depth,
         "elapsed": round(time.perf_counter() - t0, 3),
         "cancelled": False,
