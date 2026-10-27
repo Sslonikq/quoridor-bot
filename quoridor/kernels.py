@@ -1649,3 +1649,430 @@ def mcts_compact(
                 dkid[edges + i] = -1
         edges += nne[x]
     return tail, edges
+
+
+# ---------- endgame solver (phase 9, step 5) ----------
+#
+# Exact port of quoridor.endgame._PyCore (see that module): depth-limited negamax over all
+# legal moves with node-relative mate values, exact cuts, the TT (keys of
+# quoridor.endgame.tt_key, always replace) and the same move order, so the two cores
+# visit the same nodes. eg_search is the root call; ctr = [nodes, limit, aborted, best
+# move of the root]; mvbuf / kbuf hold the ordered moves of each ply, lay the shortest
+# path layers of the node being expanded (used before descending only). No recursion: a
+# self-recursive njit function crashes when numba loads it from the disk cache.
+
+EG_MATE = 1000
+EG_INF = 30000
+EG_LOWER = 1
+EG_UPPER = 2
+EG_K_TT = 100_000
+EG_K_STEP_AHEAD = 6_000
+EG_K_STEP_BEHIND = 2_500
+EG_K_OTHER_PAWN = 500
+EG_K_WALL_GAIN = 2_000
+EG_K_WALL_NONE = -1_000
+EG_K_WALL_QUIET = -2_000
+_EG_CV = _U(0x5851F42D4C957F2D)
+_EG_CS = _U(0x2545F4914F6CDD1D)
+
+
+@njit(cache=True)
+def _eg_mix(x):
+    z = x + _GOLDEN
+    z = (z ^ (z >> _S30)) * _MIX1
+    z = (z ^ (z >> _S27)) * _MIX2
+    return z ^ (z >> _S31)
+
+
+@njit(cache=True)
+def _eg_key(hb, vb, u0, u1, w0, w1, p):
+    small = _U(u0 | (u1 << 7) | (w0 << 14) | (w1 << 18) | (p << 22))
+    k = _eg_mix(hb) ^ _eg_mix(vb ^ _EG_CV) ^ _eg_mix(small ^ _EG_CS)
+    if k == ZERO:
+        k = ONE
+    return k
+
+
+@njit(cache=True)
+def _eg_adj(s):
+    if s > 0:
+        return -s + 1
+    if s < 0:
+        return -s - 1
+    return 0
+
+
+@njit(cache=True)
+def _eg_inv(v):
+    if v >= EG_INF:
+        return -EG_INF
+    if v <= -EG_INF:
+        return EG_INF
+    if v > 0:
+        return -(v + 1)
+    if v < 0:
+        return 1 - v
+    return 0
+
+
+@njit(cache=True)
+def _eg_can(d, k, man, t0):
+    """endgame.can_reach."""
+    if k <= 0:
+        return False
+    need = man - 1 - 2 * t0
+    i0 = 0 if need <= 0 else (need + 3) // 4
+    j = k - i0 if k > i0 else 0
+    return d <= k + j
+
+
+@njit(cache=True)
+def _shr(lo, hi, s):
+    return (lo >> _U(s)) | (hi << _U(64 - s)), hi >> _U(s)
+
+
+@njit(cache=True)
+def _eg_edges(ll, lh, n):
+    """endgame._edges on n layers: (ev_lo, ev_hi, eh_lo, eh_hi)."""
+    evl = ZERO
+    evh = ZERO
+    ehl = ZERO
+    ehh = ZERO
+    for k in range(n - 1):
+        al = ll[k]
+        ah = lh[k]
+        bl = ll[k + 1]
+        bh = lh[k + 1]
+        b9l, b9h = _shr(bl, bh, 9)
+        a9l, a9h = _shr(al, ah, 9)
+        evl |= (al & b9l) | (bl & a9l)
+        evh |= (ah & b9h) | (bh & a9h)
+        b1l, b1h = _shr(bl, bh, 1)
+        a1l, a1h = _shr(al, ah, 1)
+        ehl |= (al & b1l) | (bl & a1l)
+        ehh |= (ah & b1h) | (bh & a1h)
+    return evl, evh, ehl, ehh
+
+
+@njit(cache=True)
+def _eg_touch(el, eh, i, w):
+    """Wall w (first cell i) blocks an edge of the set (el, eh): h walls test the
+    vertical edges at i and i + 1, v walls the horizontal ones at i and i + 9."""
+    j = i + 1 if w & 1 == 0 else i + 9
+    return _bit(el, eh, i) or _bit(el, eh, j)
+
+
+_F_U0 = 0
+_F_U1 = 1
+_F_W0 = 2
+_F_W1 = 3
+_F_P = 4
+_F_R = 5
+_F_ALPHA = 6
+_F_BETA = 7
+_F_A0 = 8
+_F_BEST = 9
+_F_BM = 10
+_F_I = 11
+_F_CNT = 12
+_F_IDX = 13
+EG_FIELDS = 14
+
+
+@njit(cache=True)
+def _eg_enter(ply, sm, si, sk, shift, tk, tv, td, tf, tm, ctr, mvbuf, kbuf, lay):
+    """The part of endgame._PyCore._search before the move loop for the node on `ply`
+    (position in sm[ply] / si[ply], window in si[ply]): (True, value) if the node is
+    decided here, else (False, 0) with its ordered moves in mvbuf[ply] and the loop
+    fields of si[ply] set."""
+    ctr[0] += 1
+    if ctr[0] > ctr[1]:
+        ctr[2] = 1
+        return True, 0
+    row = si[ply]
+    r = row[_F_R]
+    if r <= 0:
+        return True, 0
+    srow = sm[ply]
+    m = (srow[0], srow[1], srow[2], srow[3], srow[4], srow[5], srow[6], srow[7])
+    hb = srow[8]
+    vb = srow[9]
+    u0 = row[_F_U0]
+    u1 = row[_F_U1]
+    w0 = row[_F_W0]
+    w1 = row[_F_W1]
+    p = row[_F_P]
+    alpha = row[_F_ALPHA]
+    beta = row[_F_BETA]
+    if p == 0:
+        u = u0
+        o = u1
+        goal = 8
+    else:
+        u = u1
+        o = u0
+        goal = 0
+    mv = mvbuf[ply]
+    kb = kbuf[ply]
+    npm = _pawn_moves(m, u, o, mv)
+    for i in range(npm):
+        if mv[i] // N == goal:
+            return True, EG_MATE - 1
+    if r == 1:
+        return True, 0
+    q = 1 - p
+    mywalls = w0 if p == 0 else w1
+    sl, sh = _cell(u)
+    n_me = _layers(m, sl, sh, GOAL[p, 0], GOAL[p, 1], lay[0], lay[1])
+    d_me = n_me - 1
+    ol, oh = _cell(o)
+    if mywalls > 0:
+        n_op = _layers(m, ol, oh, GOAL[q, 0], GOAL[q, 1], lay[2], lay[3])
+        d_op = n_op - 1
+    else:
+        n_op = 0
+        d_op = _dist(m, ol, oh, GOAL[q, 0], GOAL[q, 1])
+    man = abs(u % N - o % N) + abs(u // N - o // N)
+    can_me = _eg_can(d_me, (r + 1) // 2, man, 0)
+    can_op = _eg_can(d_op, r // 2, man, 1)
+    if not can_me and not can_op:
+        return True, 0
+    hi = EG_MATE - 3 if can_me else 0
+    lo_b = -(EG_MATE - 2) if can_op else 0
+    if hi <= alpha:
+        return True, hi
+    if lo_b >= beta:
+        return True, lo_b
+    if alpha < lo_b:
+        alpha = lo_b
+    if beta > hi:
+        beta = hi
+    key = _eg_key(hb, vb, u0, u1, w0, w1, p)
+    idx = np.int64(key >> _U(shift))
+    ttm = -1
+    if tk[idx] == key:
+        t_v = np.int64(tv[idx])
+        t_d = np.int64(td[idx])
+        t_f = tf[idx]
+        ttm = np.int64(tm[idx])
+        if t_f == 0:
+            if t_v != 0:
+                if EG_MATE - abs(t_v) <= r:
+                    return True, t_v
+                return True, 0
+            if r <= t_d:
+                return True, 0
+        elif t_f == EG_LOWER:
+            if (t_v <= 0 and r <= t_d) or (t_v > 0 and r >= t_d):
+                if t_v >= beta:
+                    return True, t_v
+                if t_v > alpha:
+                    alpha = t_v
+        elif (t_v >= 0 and r <= t_d) or (t_v < 0 and r >= t_d):
+            if t_v <= alpha:
+                return True, t_v
+            if t_v < beta:
+                beta = t_v
+    # moves: the pawn targets are already in mv[0:npm]
+    step = EG_K_STEP_AHEAD if d_me <= d_op else EG_K_STEP_BEHIND
+    for i in range(npm):
+        c = mv[i]
+        if d_me >= 1 and _bit(lay[0][1], lay[1][1], c):
+            k = step + 100
+        elif d_me >= 2 and _bit(lay[0][2], lay[1][2], c):
+            k = step + 200
+        else:
+            k = EG_K_OTHER_PAWN
+        kb[i] = EG_K_TT if c == ttm else k
+    cnt = npm
+    if mywalls > 0:
+        evpl, evph, ehpl, ehph = _eg_edges(lay[0], lay[1], n_me)
+        evol, evoh, ehol, ehoh = _eg_edges(lay[2], lay[3], n_op)
+        for w in range(128):
+            if not _fits(hb, vb, w):
+                continue
+            pp = w >> 1
+            i = (pp // 8) * N + pp % 8
+            if w & 1 == 0:
+                tp = _eg_touch(evpl, evph, i, w)
+                to = _eg_touch(evol, evoh, i, w)
+            else:
+                tp = _eg_touch(ehpl, ehph, i, w)
+                to = _eg_touch(ehol, ehoh, i, w)
+            if tp or to:
+                m2 = _with_wall(m, w)
+                d1 = d_me
+                if tp:
+                    d1 = _dist(m2, sl, sh, GOAL[p, 0], GOAL[p, 1])
+                    if d1 < 0:
+                        continue
+                d2 = d_op
+                if to:
+                    d2 = _dist(m2, ol, oh, GOAL[q, 0], GOAL[q, 1])
+                    if d2 < 0:
+                        continue
+                g = (d2 - d_op) - (d1 - d_me)
+                if g > 0:
+                    k = EG_K_WALL_GAIN + 1000 * g
+                else:
+                    k = EG_K_WALL_NONE + 100 * g
+            else:
+                k = EG_K_WALL_QUIET
+            code = WALL_MOVE + w
+            mv[cnt] = code
+            kb[cnt] = EG_K_TT if code == ttm else k
+            cnt += 1
+    if cnt == 0:
+        return True, 0
+    # stable insertion sort, keys descending
+    for i in range(1, cnt):
+        kk = kb[i]
+        cc = mv[i]
+        j = i - 1
+        while j >= 0 and kb[j] < kk:
+            kb[j + 1] = kb[j]
+            mv[j + 1] = mv[j]
+            j -= 1
+        kb[j + 1] = kk
+        mv[j + 1] = cc
+    row[_F_ALPHA] = alpha
+    row[_F_BETA] = beta
+    row[_F_A0] = alpha
+    row[_F_BEST] = -EG_INF
+    row[_F_BM] = -1
+    row[_F_I] = 0
+    row[_F_CNT] = cnt
+    row[_F_IDX] = idx
+    sk[ply] = key
+    return False, 0
+
+
+@njit(cache=True)
+def _eg_child(ply, sm, si, c):
+    """Position of move c of the node on `ply` into ply + 1 (window from the parent's)."""
+    a = si[ply]
+    b = si[ply + 1]
+    sa = sm[ply]
+    sb = sm[ply + 1]
+    for k in range(10):
+        sb[k] = sa[k]
+    b[_F_U0] = a[_F_U0]
+    b[_F_U1] = a[_F_U1]
+    b[_F_W0] = a[_F_W0]
+    b[_F_W1] = a[_F_W1]
+    p = a[_F_P]
+    b[_F_P] = 1 - p
+    b[_F_R] = a[_F_R] - 1
+    b[_F_ALPHA] = _eg_inv(a[_F_BETA])
+    b[_F_BETA] = _eg_inv(a[_F_ALPHA])
+    if c < WALL_MOVE:
+        if p == 0:
+            b[_F_U0] = c
+        else:
+            b[_F_U1] = c
+        return
+    w = c - WALL_MOVE
+    for k in range(8):
+        sb[k] = sa[k] & ~WB[w, k]
+    if w & 1 == 0:
+        sb[8] = _add_bit(sa[8], w >> 1)
+    else:
+        sb[9] = _add_bit(sa[9], w >> 1)
+    if p == 0:
+        b[_F_W0] -= 1
+    else:
+        b[_F_W1] -= 1
+
+
+@njit(cache=True)
+def eg_search(m0, m1, m2, m3, m4, m5, m6, m7, hb, vb, u0, u1, w0, w1, p, r, limit, shift,
+              tk, tv, td, tf, tm, ctr, mvbuf, kbuf, lay, sm, si, sk):  # fmt: skip
+    """endgame._PyCore.root without recursion (numba cannot load a cached self-recursive
+    function): the value of a depth-r search, the same nodes in the same order.
+    ctr = [nodes, limit, aborted, best move of the root (-1: none)]; sm / si / sk: the
+    per-ply node stack (EG_FIELDS integer fields, masks + wall sets, TT key)."""
+    ctr[0] = 0
+    ctr[1] = limit
+    ctr[2] = 0
+    ctr[3] = -1
+    s0 = sm[0]
+    s0[0] = m0
+    s0[1] = m1
+    s0[2] = m2
+    s0[3] = m3
+    s0[4] = m4
+    s0[5] = m5
+    s0[6] = m6
+    s0[7] = m7
+    s0[8] = hb
+    s0[9] = vb
+    r0 = si[0]
+    r0[_F_U0] = u0
+    r0[_F_U1] = u1
+    r0[_F_W0] = w0
+    r0[_F_W1] = w1
+    r0[_F_P] = p
+    r0[_F_R] = r
+    r0[_F_ALPHA] = -EG_INF
+    r0[_F_BETA] = EG_INF
+    ply = 0
+    value = 0
+    entering = True
+    while True:
+        if entering:
+            done, value = _eg_enter(ply, sm, si, sk, shift, tk, tv, td, tf, tm, ctr, mvbuf,
+                                    kbuf, lay)  # fmt: skip
+            if ctr[2] != 0:
+                return 0
+            if not done:
+                entering = False
+                row = si[ply]
+                row[_F_I] = 1
+                _eg_child(ply, sm, si, mvbuf[ply][0])
+                ply += 1
+                entering = True
+                continue
+        else:
+            # value of the child just finished, back on its parent
+            row = si[ply]
+            v = _eg_adj(value)
+            cut = False
+            if v > row[_F_BEST]:
+                row[_F_BEST] = v
+                row[_F_BM] = mvbuf[ply][row[_F_I] - 1]
+                if v > row[_F_ALPHA]:
+                    row[_F_ALPHA] = v
+                    if v >= row[_F_BETA]:
+                        cut = True
+            if not cut and row[_F_I] < row[_F_CNT]:
+                i = row[_F_I]
+                row[_F_I] = i + 1
+                _eg_child(ply, sm, si, mvbuf[ply][i])
+                ply += 1
+                entering = True
+                continue
+            best = row[_F_BEST]
+            if best >= row[_F_BETA]:
+                flag = EG_LOWER
+            elif best <= row[_F_A0]:
+                flag = EG_UPPER
+            else:
+                flag = 0
+            idx = row[_F_IDX]
+            tk[idx] = sk[ply]
+            tv[idx] = best
+            td[idx] = row[_F_R]
+            tf[idx] = flag
+            tm[idx] = row[_F_BM]
+            value = best
+        # `value` is the value of the node on `ply`: return it to the parent
+        if ply == 0:
+            break
+        ply -= 1
+        entering = False
+    if ctr[2] == 0:
+        key = _eg_key(hb, vb, u0, u1, w0, w1, p)
+        idx = np.int64(key >> _U(shift))
+        if tk[idx] == key:
+            ctr[3] = tm[idx]
+    return value

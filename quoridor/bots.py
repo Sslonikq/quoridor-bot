@@ -508,7 +508,13 @@ def make_mcts_match(seed: int) -> MCTSBot:
 # MCTS2 (phase 9, step 4, report 0083): the MCTS with lazy expansion (a leaf gets its
 # moves on its second visit: x1.3-1.5 simulations per second, half the edge memory) and a
 # strong repetition penalty (game03 21+, game07 26: no walking back into own cells).
-MCTS2_OPTIONS: dict[str, float] = {**MCTS_OPTIONS, "rep_penalty": 1.0, "expand_visits": 2}
+# Report 0084: plus the exact endgame solver at the root when both sides have <= 2 walls.
+MCTS2_OPTIONS: dict[str, float] = {
+    **MCTS_OPTIONS,
+    "rep_penalty": 1.0,
+    "expand_visits": 2,
+    "solver": 2,
+}
 
 
 def _mcts2(seed: int, **limit: float) -> MCTSBot:

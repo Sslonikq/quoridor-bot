@@ -25,6 +25,12 @@
   (over the pruned move set, as in alpha-beta).
 * Selection: PUCT  Q + c_puct * P * sqrt(N) / (1 + n), unvisited children with the
   parent's Q minus `fpu`. The move: most visits (ties: higher Q, then the move order).
+* Endgame solver (solver >= 0, report 0084): when both sides have at most `solver` walls
+  the root is first searched exactly by quoridor.endgame (all legal moves, proven
+  win / loss with the mate distance). A proven win plays the shortest win, a proven loss
+  the longest defence, and the result carries the mate distance (score WIN - plies,
+  MCTSResult.solved); the tree is dropped. Unproven: the MCTS runs in the rest of the
+  time, the solver's TT is kept for the next move.
 * Tree reuse: the subtree of the new position is kept if it is a child or grandchild of
   the last root.
 * rep_penalty (value units): root moves back to an own (cell, walls left) of the last
@@ -51,6 +57,7 @@ from dataclasses import dataclass
 
 from quoridor import jit as _jit
 from quoridor.bitpaths import m8
+from quoridor.endgame import EndgameSolver, SolverCancelled, SolveResult
 from quoridor.eval import WIN
 from quoridor.rules import apply_move_unchecked, pawn_moves, winner
 from quoridor.search import (
@@ -83,6 +90,12 @@ MCTS_DEFAULTS: dict[str, float] = {
     "tree_defense": 0,
     "rep_penalty": 0.0,
     "expand_visits": 1,  # 2: a leaf is evaluated on its first visit, expanded on the second
+    # exact endgame solver at the root (report 0084): when both sides have at most
+    # `solver` walls (-1: off), quoridor.endgame first gets solver_share of the time limit
+    # (sims only: solver_nodes nodes per simulation); a proven result is played at once
+    "solver": -1,
+    "solver_share": 0.5,
+    "solver_nodes": 200,
 }
 CORES = ("jit", "py")
 
@@ -128,6 +141,7 @@ class MCTSResult:
     elapsed: float
     visits: int  # root visits (with reused ones)
     max_depth: int  # deepest node reached in this search
+    solved: SolveResult | None = None  # the endgame solver's proven result, if any
 
     @property
     def nps(self) -> float:
@@ -265,6 +279,11 @@ class MCTS:
         self.tree_defense = int(o["tree_defense"])
         self.rep_penalty = float(o["rep_penalty"])
         self.expand_visits = int(o["expand_visits"])
+        self.solver = int(o["solver"])
+        self.solver_share = float(o["solver_share"])
+        self.solver_nodes = int(o["solver_nodes"])
+        self._solver: EndgameSolver | None = None  # created on first use (its TT is kept)
+        self.last_solve: SolveResult | None = None  # the solver's result of the last search
         if self.expand_visits not in (1, 2):
             raise ValueError("MCTS: expand_visits must be 1 or 2")
         settings = dict(searcher_settings or {})
@@ -805,6 +824,24 @@ class MCTS:
                 self._jstate = None
                 self._pen = None
                 return MCTSResult(p, PROVEN_SCORE, 1, 1, time.perf_counter() - t0, 1, 1)
+        self.last_solve = None
+        if self.solver >= 0 and max(state.walls_left) <= self.solver:
+            sol = self._solve(state, sims, time_limit, should_stop)
+            if sol.proven:
+                assert sol.move is not None
+                self._root = None
+                self._jstate = None
+                self._pen = None
+                return MCTSResult(
+                    sol.move,
+                    sol.score,
+                    abs(sol.plies),
+                    0,
+                    time.perf_counter() - t0,
+                    0,
+                    abs(sol.plies),
+                    sol,
+                )
         s = self.s
         s._reset(state)
         self._keep_on_cancel = keep_on_cancel
@@ -836,6 +873,26 @@ class MCTS:
             )
         finally:
             s._free()
+
+    def _solve(
+        self,
+        state: GameState,
+        sims: int | None,
+        time_limit: float | None,
+        should_stop: Callable[[], bool] | None,
+    ) -> SolveResult:
+        """The endgame solver on the root: solver_share of time_limit and / or
+        solver_nodes * sims nodes. should_stop() true raises MCTSCancelled(0)."""
+        if self._solver is None:
+            self._solver = EndgameSolver(core="py" if self.core == "py" else None)
+        nodes = None if sims is None else max(1, self.solver_nodes * sims)
+        limit = None if time_limit is None else time_limit * self.solver_share
+        try:
+            sol = self._solver.solve(state, limit, nodes, should_stop=should_stop)
+        except SolverCancelled:
+            raise MCTSCancelled(0) from None
+        self.last_solve = sol
+        return sol
 
     def _score(self, kw: float, kn: int) -> int:
         """Centi-steps of a child (value sum kw over kn visits, child's side) for the
