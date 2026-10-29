@@ -21,6 +21,7 @@ from quoridor.search import (
     COMBO_COST,
     COMBO_K,
     DEFAULT_WALL_LIMIT,
+    RESERVE_K,
     V2_TT_BITS,
     Searcher,
     SearchResult,
@@ -161,6 +162,9 @@ V5_OPTIONS: dict[str, int] = {
     "progress": 0,
     "race_plan": PLAN_V4,
     "race_soft": SOFT_V4,
+    "reserve_combo": 0,
+    "reserve_k": RESERVE_K,
+    "reserve_min": 0,
 }
 
 
@@ -541,6 +545,48 @@ def make_mcts2_match(seed: int) -> MCTSBot:
     return _mcts2(seed, move_time=MATCH_MOVE_TIME)
 
 
+# MCTS3 (phase 9, report 0085): mcts2 whose leaf eval weighs a big opponent wall stock by
+# what its best combination can do. While the opponent has >= 3 walls and we have 0-2, the
+# flat reserve term (reserve per opponent wall) becomes reserve_combo per step that the
+# opponent's best combination of up to reserve_k walls adds to our path
+# (Searcher.combo_gain); with 1-2 opponent walls the flat term stays. game07 moves 25 / 27
+# (a cage of seven black walls) drop to <= 0, game03 moves 16 / 17 (seven walls against a
+# one-cell corridor) stop counting as a plus. Selection at 2 s against mcts2 (100 games,
+# the same seeds): reserve_combo 75 / 100 with the threshold 53% / 43%, without it 48% / 33%.
+MCTS3_RESERVE_COMBO = 75
+MCTS3_SEARCHER: dict[str, int] = {
+    **MCTS_SEARCHER,
+    "reserve_combo": MCTS3_RESERVE_COMBO,
+    "reserve_k": RESERVE_K,
+    "reserve_min": 3,
+}
+MCTS3_OPTIONS: dict[str, float] = dict(MCTS2_OPTIONS)
+
+
+def _mcts3(seed: int, **limit: float) -> MCTSBot:
+    return MCTSBot(seed, searcher_settings=MCTS3_SEARCHER, **limit, **MCTS3_OPTIONS)  # type: ignore[arg-type]
+
+
+def make_mcts3(seed: int) -> MCTSBot:
+    """MCTS3 with MCTS_SIMS simulations per move (deterministic per seed)."""
+    return _mcts3(seed, sims=MCTS_SIMS)
+
+
+def make_mcts3_clock(seed: int) -> MCTSBot:
+    """MCTS3 on a 10-minute game clock."""
+    return _mcts3(seed, game_time=GAME_TIME)
+
+
+def make_mcts3_fast(seed: int) -> MCTSBot:
+    """MCTS3 with FAST_MOVE_TIME per move."""
+    return _mcts3(seed, move_time=FAST_MOVE_TIME)
+
+
+def make_mcts3_match(seed: int) -> MCTSBot:
+    """MCTS3 with MATCH_MOVE_TIME per move."""
+    return _mcts3(seed, move_time=MATCH_MOVE_TIME)
+
+
 def make_v4_frozen(seed: int) -> SearchBot:
     """v4 exactly as in reports 0061/0062 (quoridor/frozen/search_v4.py), depth V4_DEPTH.
 
@@ -605,6 +651,10 @@ BOTS: dict[str, BotFactory] = {
     "mcts2-clock": make_mcts2_clock,
     "mcts2-0.2s": make_mcts2_fast,
     "mcts2-3s": make_mcts2_match,
+    "mcts3": make_mcts3,
+    "mcts3-clock": make_mcts3_clock,
+    "mcts3-0.2s": make_mcts3_fast,
+    "mcts3-3s": make_mcts3_match,
 }
 # Bots whose play does not depend on the seed in a meaningful way (seed only breaks ties):
 # a mirror match of such a bot repeats the same game.

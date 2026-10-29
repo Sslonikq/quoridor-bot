@@ -691,6 +691,10 @@ class MCTS:
         ip[_K.IP_RACE_MIN_GAIN] = s.race_min_gain
         ip[_K.IP_WALL_LIMIT] = s.wall_limit
         ip[_K.IP_EXPAND] = self.expand_visits
+        ip[_K.IP_RESERVE_COMBO] = s.reserve_combo
+        ip[_K.IP_RESERVE_K] = s.reserve_k
+        ip[_K.IP_COMBO_LEVELS] = s.combo_levels
+        ip[_K.IP_RESERVE_MIN] = s.reserve_min
         fp = np.zeros(_K.FP_SIZE, dtype=np.float64)
         fp[_K.FP_C_PUCT] = self.c_puct
         fp[_K.FP_SCALE] = self.scale
@@ -721,7 +725,7 @@ class MCTS:
             vb |= 1 << (y * 8 + x)
         rpawn = np.array([c[1] * 9 + c[0] for c in state.pawns], dtype=np.int64)
         rwl = np.array(state.walls_left, dtype=np.int64)
-        ct = np.zeros((2, 81, 3 + self.s.combo_k), dtype=np.int64)
+        ct = np.zeros((2, 81, 3 + self.s.combo_levels), dtype=np.int64)
         rhb, rvb = np.uint64(hb), np.uint64(vb)
         if self._memo is None:
             size = 1 << _K.CACHE_BITS

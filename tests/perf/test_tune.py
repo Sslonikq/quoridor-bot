@@ -67,6 +67,8 @@ def test_parse_spec_v4_v5_and_mcts():
     assert b._mcts.s.combo == 40 and b._mcts.s.wall_limit == 7 and b._mcts.c_puct == 1.0
     b = tune.parse_spec("mcts2:move_time=10.0", 0.3)(0)
     assert b.move_time == 10.0 and b._mcts.expand_visits == 2 and b._mcts.rep_penalty == 1.0
+    b = tune.parse_spec("mcts3:s_reserve_combo=60", 0.3)(0)
+    assert b._mcts.s.reserve_combo == 60 and b._mcts.s.reserve_min == 3 and b._mcts.solver == 2
     b = tune.parse_spec("mcts:sims=50", 0.3)(0)
     assert b.sims == 50 and b.move_time is None
     assert tune.uses_default_move_time("mcts:") and not tune.uses_default_move_time("mcts:sims=5")

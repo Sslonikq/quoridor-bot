@@ -69,6 +69,7 @@ from quoridor.bitpaths import GOAL_MASK, WALL_NOT_OF_CODE, Masks, add_wall, bit,
 from quoridor.eval import (
     PLAN_V4,
     RACE_MIN_GAIN_V4,
+    RESERVE_SHARE,
     SOFT_V4,
     STEP,
     WALL,
@@ -121,6 +122,7 @@ COMBO_K = 4  # at most this many walls in a combination
 COMBO_BEAM = 4  # beam width of the combination search
 COMBO_COST = 100  # centi-steps per wall of a combination (the move spent on it)
 COMBO_CACHE_LIMIT = 20_000  # combo memo entries (kept between searches), cleared when full
+RESERVE_K = 7  # reserve_combo: the opponent's combination of at most this many walls
 REP_WINDOW = 8  # rep_penalty looks at this many last own positions of the game
 # rep_penalty, proven loss (_practical_loss): a move that does not go back to a recent own
 # position may lose this many plies faster than delay_slack allows
@@ -391,8 +393,24 @@ class Searcher:
         progress: int = 0,
         race_plan: int = PLAN_V4,
         race_soft: int = SOFT_V4,
+        reserve_combo: int = 0,
+        reserve_k: int = RESERVE_K,
+        reserve_min: int = 0,
     ) -> None:
         self._rng = random.Random(seed)
+        # mcts3 (phase 9, report 0085): the reserve term on the opponent's combination
+        # instead of its wall count. While a side has 0 / 1 / 2 walls, it loses
+        # reserve_combo * RESERVE_SHARE[own] / 4 per step that the opponent's best
+        # combination of at most min(its walls, reserve_k) walls adds to its path
+        # (combo_gain; quoridor.threat on the root walls). 0: off. Seven walls that can
+        # build a cage (game07) weigh much more than seven walls against a pawn in a
+        # one-cell corridor (game03), where the flat reserve overrates them.
+        # reserve_min: only while the opponent has at least this many walls (a big
+        # stock); then this replaces the flat reserve term of that side, below it the
+        # flat term stays (endgames with 1-2 walls each: report 0085).
+        self.reserve_combo = reserve_combo
+        self.reserve_k = max(1, reserve_k)
+        self.reserve_min = max(1, reserve_min)
         # v5 (phase 9, step 3): combined wall threats (quoridor.threat), all off by default.
         # combo: per step of (our walls' combined potential against the opponent's path -
         # theirs against ours), see _combo_term; combo_k / combo_beam: the size of the
@@ -401,6 +419,9 @@ class Searcher:
         # the opponent's best combinations (_combo_walls).
         self.combo = combo
         self.combo_k = max(1, combo_k)
+        # levels of the memoised combination search (the first combo_k serve combo /
+        # combo_root; a beam level does not depend on how many levels follow it)
+        self.combo_levels = max(self.combo_k, self.reserve_k if reserve_combo else 0)
         self.combo_beam = max(1, combo_beam)
         self.combo_cost = combo_cost
         self.combo_root = combo_root
@@ -542,20 +563,22 @@ class Searcher:
                 score += self.threat * (g_me - g_op)
             if self.combo or self.combo_stock:
                 score += self._combo_term(state, me, d_me, d_op, wm, wo)
+            if self.reserve_combo:
+                score += self._reserve_combo_term(state, me, d_me, d_op, wm, wo)
             return score
         return evaluate_dists(d_me, d_op, wm, wo, wall_weight=self.wall_weight)
 
     # ---------- v5: combined wall threats ----------
 
     def combo_of(self, m: Masks, h: frozenset, v: frozenset, cell: Cell, player: int) -> tuple:
-        """quoridor.threat.combo_threat (combo_k walls, combo_beam), memoised and kept
-        between searches (bounded by COMBO_CACHE_LIMIT)."""
+        """quoridor.threat.combo_threat (combo_levels walls, combo_beam), memoised and
+        kept between searches (bounded by COMBO_CACHE_LIMIT)."""
         key = (m, cell, player)
         cache = self._combo_cache
         hit = cache.get(key)
         if hit is None:
             hit = combo_threat(
-                m, h, v, cell, player, self.combo_k, self.combo_beam, self.combo_narrow
+                m, h, v, cell, player, self.combo_levels, self.combo_beam, self.combo_narrow
             )
             if len(cache) >= COMBO_CACHE_LIMIT:
                 cache.clear()
@@ -580,7 +603,7 @@ class Searcher:
         d0, ds, _ = self.combo_of(m, h, v, cell, player)
         best = 0
         cost = self.combo_cost
-        for j in range(min(walls, len(ds))):
+        for j in range(min(walls, len(ds), self.combo_k)):
             val = (ds[j] - d0) * STEP - (j + 1) * cost
             if val > best:
                 best = val
@@ -588,6 +611,36 @@ class Searcher:
             return 0
         best -= (d_now - d0) * STEP
         return best if best > 0 else 0
+
+    def combo_gain(self, cell: Cell, player: int, walls: int, d_now: int) -> int:
+        """Steps (>= 0) the best combination of at most min(walls, reserve_k) opponent
+        walls adds to `player`'s path from `cell`: on the ROOT walls (as potential, one
+        memo entry per cell), minus what the walls placed inside the tree already took
+        (d_now: the distance on the node's walls). No per-wall cost: reserve_combo."""
+        m, h, v = self._root_walls
+        _, ds, _ = self.combo_of(m, h, v, cell, player)
+        j = min(walls, len(ds), self.reserve_k)
+        if j <= 0:
+            return 0
+        g = ds[j - 1] - d_now
+        return g if g > 0 else 0
+
+    def _reserve_combo_term(
+        self, state: GameState, me: int, d_me: int, d_op: int, wm: int, wo: int
+    ) -> int:
+        """reserve_combo: while the opponent has >= reserve_min walls, the side with
+        0 / 1 / 2 walls loses reserve_combo * RESERVE_SHARE[own] / 4 per step of the
+        opponent's combination (combo_gain) instead of the flat reserve term (which
+        evaluate_v4 added and is taken back here)."""
+        r, lo, flat = self.reserve_combo, self.reserve_min, self.reserve
+        score = 0
+        if wo >= lo and wm < len(RESERVE_SHARE):
+            g = self.combo_gain(state.pawns[me], me, wo, d_me)
+            score += _reserve_threat(wm, wo, flat) - r * RESERVE_SHARE[wm] * g // 4
+        if wm >= lo and wo < len(RESERVE_SHARE):
+            g = self.combo_gain(state.pawns[1 - me], 1 - me, wm, d_op)
+            score += r * RESERVE_SHARE[wo] * g // 4 - _reserve_threat(wo, wm, flat)
+        return score
 
     def _combo_term(self, state: GameState, me: int, d_me: int, d_op: int, wm: int, wo: int) -> int:
         """combo per step of (our walls' potential against the opponent - theirs against
@@ -1158,7 +1211,7 @@ class Searcher:
         self._tt = {} if use_tt else None  # lazily filled slots, at most 2**tt_bits
         self._root_info = None
         self._path_keys = {zobrist(state)} if self.rep else set()
-        if self.combo or self.combo_root or self.combo_stock:
+        if self.combo or self.combo_root or self.combo_stock or self.reserve_combo:
             self._root_walls = (self.masks(state), state.h_walls, state.v_walls)
 
     def _free(self) -> None:

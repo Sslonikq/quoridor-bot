@@ -767,8 +767,8 @@ def cand_walls(m0, m1, m2, m3, m4, m5, m6, m7, my_cell, op_cell, me, limit):
 # path from the root, no states are stored. Exact port of the pure-Python MCTS with its
 # searcher settings (tests/search/test_mcts.py compares the two trees):
 #   _pawn_moves  <- search.pawn_moves_m / rules.pawn_moves_for
-#   _eval        <- search.Searcher.evaluate (v1-v3 / v4, threat, reserve, combo on the
-#                   root walls; combo_exact = combo_stock = 0)
+#   _eval        <- search.Searcher.evaluate (v1-v3 / v4, threat, reserve, combo and
+#                   reserve_combo on the root walls; combo_exact = combo_stock = 0)
 #   _race_best   <- the first entry of race_cands (Searcher._race_cands)
 #   _cand_walls  <- Searcher.candidate_walls without the threat branch (as cand_walls)
 #   _saving      <- Searcher._saving_walls
@@ -791,7 +791,11 @@ IP_RACE_SOFT = 10
 IP_RACE_MIN_GAIN = 11
 IP_WALL_LIMIT = 12
 IP_EXPAND = 13  # mcts expand_visits: a leaf is expanded on its visit number this (1 or 2)
-IP_SIZE = 14
+IP_RESERVE_COMBO = 14  # Searcher.reserve_combo (report 0085)
+IP_RESERVE_K = 15  # Searcher.reserve_k
+IP_COMBO_LEVELS = 16  # Searcher.combo_levels: levels of the combination memo ct
+IP_RESERVE_MIN = 17  # Searcher.reserve_min
+IP_SIZE = 18
 
 FP_C_PUCT = 0
 FP_SCALE = 1
@@ -1042,24 +1046,30 @@ def _wall_race(m, hb, vb, bcell, b, n, min_gain, ll, lh, seen, ck, cv):
 
 
 @njit(cache=True)
-def _potential(ct, rm, cell, player, walls, d_now, ip):
-    """Searcher.potential on the root walls rm (combo_exact = 0), the combination search
-    memoised in ct[player, cell] = [computed, d0, levels, best_d...]."""
+def _combo_fill(ct, rm, cell, player, ip):
+    """Searcher.combo_of on the root walls rm (combo_levels walls), memoised in
+    ct[player, cell] = [computed, d0, levels, best_d...]."""
     if ct[player, cell, 0] == 0:
         r = combo(
             rm[0], rm[1], rm[2], rm[3], rm[4], rm[5], rm[6], rm[7],
-            cell, player, ip[IP_COMBO_K], ip[IP_COMBO_BEAM], ip[IP_COMBO_NARROW],
+            cell, player, ip[IP_COMBO_LEVELS], ip[IP_COMBO_BEAM], ip[IP_COMBO_NARROW],
         )  # fmt: skip
         ct[player, cell, 1] = r[0]
         ct[player, cell, 2] = r[1]
         for i in range(r[1]):
             ct[player, cell, 3 + i] = r[2 + i]
         ct[player, cell, 0] = 1
+
+
+@njit(cache=True)
+def _potential(ct, rm, cell, player, walls, d_now, ip):
+    """Searcher.potential on the root walls rm (combo_exact = 0)."""
+    _combo_fill(ct, rm, cell, player, ip)
     d0 = ct[player, cell, 1]
     levels = ct[player, cell, 2]
     cost = ip[IP_COMBO_COST]
     best = 0
-    for j in range(min(walls, levels)):
+    for j in range(min(walls, levels, ip[IP_COMBO_K])):
         val = (ct[player, cell, 3 + j] - d0) * _STEP - (j + 1) * cost
         if val > best:
             best = val
@@ -1138,7 +1148,37 @@ def _eval(m, hb, vb, cme, cop, wm, wo, me, d_me, d_op, ip, ct, rm, ll, lh, seen,
         mine = _potential(ct, rm, cop, op, wm, d_op, ip)
         theirs = _potential(ct, rm, cme, me, wo, d_me, ip)
         score += ip[IP_COMBO] * (mine - theirs) // _STEP
+    rc = ip[IP_RESERVE_COMBO]
+    if rc:  # Searcher._reserve_combo_term (it replaces the flat reserve term of a side)
+        lo = ip[IP_RESERVE_MIN]
+        if wo >= lo and wm < 3:
+            g = _combo_gain(ct, rm, cme, me, wo, d_me, ip)
+            score += _reserve_threat(wm, wo, reserve) - rc * _reserve_share(wm) * g // 4
+        if wm >= lo and wo < 3:
+            g = _combo_gain(ct, rm, cop, op, wm, d_op, ip)
+            score += rc * _reserve_share(wo) * g // 4 - _reserve_threat(wo, wm, reserve)
     return score
+
+
+@njit(cache=True)
+def _reserve_share(own):
+    """eval.RESERVE_SHARE (quarters) for own = 0, 1, 2."""
+    if own == 0:
+        return 4
+    if own == 1:
+        return 2
+    return 1
+
+
+@njit(cache=True)
+def _combo_gain(ct, rm, cell, player, walls, d_now, ip):
+    """Searcher.combo_gain on the root walls rm."""
+    _combo_fill(ct, rm, cell, player, ip)
+    j = min(walls, ct[player, cell, 2], ip[IP_RESERVE_K])
+    if j <= 0:
+        return 0
+    g = ct[player, cell, 2 + j] - d_now
+    return g if g > 0 else 0
 
 
 @njit(cache=True)

@@ -16,6 +16,7 @@ A and B are specs:
                             s_<key>=v overrides the searcher setting <key> of the leaf
                             eval / candidates, e.g. mcts:s_combo=40,s_wall_limit=8);
   mcts2:k=v,...             the same on bots.MCTS2_OPTIONS (report 0083).
+  mcts3:k=v,...             the same on bots.MCTS3_OPTIONS / MCTS3_SEARCHER (report 0085).
 If move_time/depth/game_time/sims is absent in such a spec, --move-time is used.
 The games are split between --procs processes (seeds seed, seed+1, ...; colours alternate
 inside every chunk, as in the arena). Both sides play under the same machine load, so the
@@ -43,6 +44,8 @@ from quoridor.arena import GameResult, run_match, wilson_interval
 from quoridor.bots import (
     BOTS,
     MCTS2_OPTIONS,
+    MCTS3_OPTIONS,
+    MCTS3_SEARCHER,
     MCTS_OPTIONS,
     MCTS_SEARCHER,
     V4_SETTINGS,
@@ -59,7 +62,7 @@ from quoridor.timeman import MAX_TIME
 MAX_GAP = 30.0  # seconds between consecutive move stamps: more = the machine slept
 GAP_FACTOR = 3.0  # the default --max-gap is at least GAP_FACTOR * the per-move budget
 _TIME_KEYS = ("move_time", "depth", "game_time", "sims")
-_KINDS = ("search", "frozen", "frozen4", "v4", "v5", "mcts", "mcts2")
+_KINDS = ("search", "frozen", "frozen4", "v4", "v5", "mcts", "mcts2", "mcts3")
 
 
 def parse_spec(spec: str, default_move_time: float) -> BotFactory:
@@ -79,10 +82,11 @@ def parse_spec(spec: str, default_move_time: float) -> BotFactory:
         kw["move_time"] = default_move_time
 
     def factory(seed: int) -> Bot:
-        if kind in ("mcts", "mcts2"):
+        if kind in ("mcts", "mcts2", "mcts3"):
             own = {k: v for k, v in kw.items() if not k.startswith("s_")}
-            ss = {**MCTS_SEARCHER, **{k[2:]: v for k, v in kw.items() if k.startswith("s_")}}
-            base = MCTS_OPTIONS if kind == "mcts" else MCTS2_OPTIONS
+            s_base = MCTS3_SEARCHER if kind == "mcts3" else MCTS_SEARCHER
+            ss = {**s_base, **{k[2:]: v for k, v in kw.items() if k.startswith("s_")}}
+            base = {"mcts": MCTS_OPTIONS, "mcts2": MCTS2_OPTIONS, "mcts3": MCTS3_OPTIONS}[kind]
             return MCTSBot(seed, searcher_settings=ss, **{**base, **own})  # type: ignore[arg-type]
         if kind in ("v4", "v5"):
             base = V4_SETTINGS if kind == "v4" else V5_SETTINGS
