@@ -405,16 +405,21 @@ def test_mcts_analysis_top_moves_are_legal_and_sorted_by_visits():
     assert all(t["score"] <= top[0]["score"] for t in top)
 
 
-def test_mcts_button_uses_mcts2_with_the_endgame_solver():
-    """Report 0084 (the user's decision): the analyzer's MCTS is mcts2 (MCTS2_OPTIONS:
-    lazy expansion, strong repetition penalty, endgame solver at <= 2 walls)."""
+def test_mcts_button_uses_mcts3_with_the_endgame_solver():
+    """Reports 0084 / 0085: the analyzer's MCTS is the bot mcts3 (MCTS3_OPTIONS: mcts2 with
+    the endgame solver at <= 2 walls; MCTS3_SEARCHER: reserve_combo 75, reserve_k 7,
+    reserve_min 3)."""
     from quoridor.analyzer import engine
-    from quoridor.bots import MCTS2_OPTIONS
+    from quoridor.bots import MCTS3_OPTIONS, MCTS3_SEARCHER, MCTS_SEARCHER
 
     m = engine._new_mcts()
-    assert m.expand_visits == MCTS2_OPTIONS["expand_visits"] == 2
-    assert m.rep_penalty == MCTS2_OPTIONS["rep_penalty"] == 1.0
-    assert m.solver == MCTS2_OPTIONS["solver"] == 2
+    assert m.expand_visits == MCTS3_OPTIONS["expand_visits"] == 2
+    assert m.rep_penalty == MCTS3_OPTIONS["rep_penalty"] == 1.0
+    assert m.solver == MCTS3_OPTIONS["solver"] == 2
+    assert m.s.reserve_combo == MCTS3_SEARCHER["reserve_combo"] == 75
+    assert m.s.reserve_k == MCTS3_SEARCHER["reserve_k"] == 7
+    assert m.s.reserve_min == MCTS3_SEARCHER["reserve_min"] == 3
+    assert MCTS_SEARCHER.get("reserve_combo", 0) == 0  # mcts2 has no combination term
 
 
 def test_mcts_tree_is_kept_for_the_next_move_and_after_a_cancel():

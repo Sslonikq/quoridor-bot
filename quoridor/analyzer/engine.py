@@ -12,7 +12,7 @@ import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 
-from quoridor.bots import MCTS2_OPTIONS, MCTS_SEARCHER, V4_SETTINGS, V5_SETTINGS
+from quoridor.bots import MCTS3_OPTIONS, MCTS3_SEARCHER, V4_SETTINGS, V5_SETTINGS
 from quoridor.endgame import mate_text
 from quoridor.eval import WIN
 from quoridor.mcts import MCTS, PROGRESS_EVERY, MCTSCancelled
@@ -159,7 +159,9 @@ _mcts_shared: MCTS | None = None
 
 
 def _new_mcts() -> MCTS:
-    return MCTS(MCTS_SEED, MCTS_SEARCHER, **MCTS2_OPTIONS)  # mcts2 + endgame solver (0084)
+    return MCTS(
+        MCTS_SEED, MCTS3_SEARCHER, **MCTS3_OPTIONS
+    )  # mcts3 = mcts2 + reserve_combo, solver=2 (0085)
 
 
 def reset_mcts_tree() -> None:
@@ -193,7 +195,7 @@ def _rank_mcts_with(
     cancelled: Callable[[], bool],
     on_progress: Callable[[int, int], None] | None,
 ) -> tuple[list[RankedMove], int, int, int]:
-    """Top moves of the PUCT-MCTS (the bot of bots.make_mcts2_*, report 0084), the whole
+    """Top moves of the PUCT-MCTS (the bot of bots.make_mcts3_*, reports 0084, 0085), the whole
     budget in one search: the best move is the bot's choice, the others are the other
     most visited root moves (by visits, then by value; no alternative is shown above the
     best). Returns (moves, depth, simulations, reused); depth is the length of the most
