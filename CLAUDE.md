@@ -27,7 +27,7 @@ pytest -q -m "not slow"  # быстрый прогон без медленных
 pytest tests/rules -q     # только правила
 ruff check . && ruff format .
 python -m quoridor.cli    # играть против бота в консоли
-python -m quoridor.analyzer   # анализатор: доска, ходы за обе стороны, подсказки v4 (фазы 7, 10, 11)
+python -m quoridor.analyzer   # анализатор: доска, ходы за обе стороны, подсказки MCTS (mcts3) / v5 / v4, режимы 2/10/30 с (фазы 7, 9, 10, 11)
 python -m quoridor.arena --games 100 --a v2 --b v1   # матч версий бота
 # флаги арены: --seed N (по умолчанию 0), --max-moves N (лимит полуходов, по умолчанию 300; «D» = лимит, ничьих в игре нет), --quiet (без прогресса по партиям)
 # --a/--b: имена из реестра BOTS в quoridor/bots.py:
@@ -36,8 +36,10 @@ python -m quoridor.arena --games 100 --a v2 --b v1   # матч версий б�
 #   v4, v4-clock (гонка стенок, угроза стенкой, запас стенок соперника, PVS+LMR; по умолчанию в cli и анализаторе);
 #   v4-frozen, v4-frozen-clock (замороженный v4 до запаса стенок соперника, бейзлайн); v3-3s, v4-3s, v4-frozen-3s: 3 с на ход;
 #   v5, v5-clock, v5-3s, v5-0.2s (угроза комбинацией стенок, анти-топтание; фаза 9, не по умолчанию)
-#   mcts, mcts-clock, mcts-0.2s, mcts-3s (PUCT-MCTS со стенками; эксперимент фазы 9, не по умолчанию)
-#   спецификации tune: v4:k=v, v5:k=v, mcts:k=v (настройки реестра + переопределения)
+#   mcts, mcts-clock, mcts-0.2s, mcts-3s (PUCT-MCTS со стенками на numba-ядре; ядро py — эталон и откат без numba)
+#   mcts2, mcts2-clock, mcts2-0.2s, mcts2-3s (mcts + штраф за повтор, ленивое раскрытие, решатель концовки при ≤2 стенок)
+#   mcts3, mcts3-clock, mcts3-0.2s, mcts3-3s (mcts2 + запас стенок соперника по силе его комбинации; лучший бот фазы 9, в анализаторе кнопка «MCTS»)
+#   спецификации tune: v4:k=v, v5:k=v, mcts:k=v, mcts2:k=v, mcts3:k=v (настройки реестра + переопределения; s_<key> — настройка поисковика)
 #   *-0.2s (v1-0.2s, v2-0.2s, v3-0.2s, v4-0.2s, v4-frozen-0.2s, v1-frozen-0.2s): 0.2 с на ход, матчи при равном времени
 python -m tests.perf.tune A B --games 20 --procs 19 --move-time 5   # параллельный матч при равном времени
 # tune отбрасывает партии со скачком времени между ходами > --max-gap (30 с, «засыпание» машины) и печатает их число
@@ -75,7 +77,13 @@ quoridor/
   paths.py      # кратчайшие пути (BFS), кеширование
   notation.py   # строка <-> Move, единственное место, знающее формат сайта
   eval.py       # оценочная функция
-  search.py     # поиск (alpha-beta + iterative deepening; MCTS как альтернатива)
+  search.py     # поиск (alpha-beta + iterative deepening)
+  mcts.py       # PUCT-MCTS (ядра jit и py, публичный API: should_stop/on_progress, keep_on_cancel, root_children)
+  endgame.py    # точный решатель концовки (≤2 стенок у обоих), порт на numba в kernels.py
+  threat.py     # угроза комбинацией стенок (beam)
+  kernels.py    # numba-ядра: пути, оценка, дерево MCTS, решатель
+  bitpaths.py   # кратчайшие пути на битах (горячая часть paths)
+  jit.py        # обёртка numba (откат на чистый Python, QUORIDOR_NO_NUMBA=1)
   timeman.py    # распределение времени на ход
   cli.py, arena.py
   analyzer/     # анализатор: __main__.py (запуск), server.py (http.server, JSON API), static/ (HTML/CSS/JS)

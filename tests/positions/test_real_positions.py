@@ -270,6 +270,19 @@ def test_v4_handles_80_percent_of_the_real_positions():
     assert med >= score.PASS_SHARE, score.report_runs("v4", 0.0, runs, budget)
 
 
+@pytest.mark.slow
+def test_mcts3_handles_80_percent_of_the_real_positions():
+    """The final bot of phase 9 on the whole set with a fixed budget (review 0088, minor 5).
+    100k simulations are deterministic (two runs gave 17/21 = 81%, report 0090); fewer
+    simulations are below the goal (20k: 76%). The margin is one position: if this fails
+    after a change of mcts3, look at which position fell before touching the budget."""
+    budget = score.parse_budget("sims=100000")
+    runs = score.run_many("mcts3", 0.0, POSITIONS, runs=1, budget=budget)
+    score.dump_runs(score.OUT_DIR / "pytest-mcts3-sims100000.json", "mcts3", 0.0, runs, budget)
+    med, _, _ = score.median_min_max(score.run_shares(runs))
+    assert med >= score.PASS_SHARE, score.report_runs("mcts3", 0.0, runs, budget)
+
+
 # ---- the robust metric: runs, median, fixed budgets ----------------------------------------
 
 
