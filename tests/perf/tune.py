@@ -237,6 +237,12 @@ def _job(args: tuple[str, str, float, int, int, int, float]):
     return run_guarded(games, reg, seed, max_moves, gap_limit)
 
 
+def seed_text(seed: int, procs: int) -> str:
+    """The seeds of a run for the log (review 0088 nit 14): process i plays with seed + i."""
+    last = f"..{seed + procs - 1}" if procs > 1 else ""
+    return f"seed {seed} (processes {seed}{last})"
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
     p.add_argument("a")
@@ -266,13 +272,15 @@ def main(argv: list[str] | None = None) -> int:
         (ns.a, ns.b, ns.move_time, base + (i < extra), ns.seed + i, ns.max_moves, gap_limit)
         for i in range(procs)
     ]
+    seeds = seed_text(ns.seed, procs)
+    print(f"{ns.a} vs {ns.b}: {ns.games} games, {seeds}", flush=True)
     t0 = time.perf_counter()
     with ProcessPoolExecutor(procs) as ex:
         res = list(ex.map(_job, jobs))
     w, lo, d, ta, tb, pl, dropped = combine(res)
     n = w + lo + d
     lo_ci, hi_ci = wilson_interval(w + d / 2, n) if n else (0.0, 0.0)
-    print(f"{ns.a} vs {ns.b}: W {w} L {lo} D {d} n={n}")
+    print(f"{ns.a} vs {ns.b}: W {w} L {lo} D {d} n={n}  ({seeds})")
     print(
         f"score {100 * (w + d / 2) / max(n, 1):.1f}%  "
         f"Wilson95 [{100 * lo_ci:.1f}, {100 * hi_ci:.1f}]"

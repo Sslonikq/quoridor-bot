@@ -104,11 +104,17 @@ _PROVEN_SCORE = PROVEN_SCORE  # old name
 PROGRESS_EVERY = 0.2  # seconds between on_progress calls (default)
 
 # jit core: tree arrays (grown by doubling when full, up to the caps; then the search
-# stops early). Per node 19 bytes, per edge 14 bytes: the caps are ~0.6 GB together.
+# stops early and plays with what it has). Per node 19 bytes, per edge 14 bytes: the caps
+# are 2^23 * 19 + 2^25 * 14 B ~ 0.63 GB together (report 0093). A midgame node has ~4.3
+# edges, so both caps bind at ~8M simulations. One 30 s analyzer search makes ~2.5M nodes
+# / ~11M edges (~0.3 GB); only repeated searches on one position (the analyzer reuses the
+# tree) reach the caps. While a tree is compacted for reuse (_jit_root) the old and the
+# new arrays live together: the peak is at most twice the caps (~1.3 GB), and only then.
 _NODES0 = 1 << 15
 _EDGES0 = 1 << 19
-MAX_NODES = 1 << 24
+MAX_NODES = 1 << 23
 MAX_EDGES = 1 << 25
+_REUSE_EDGE_ROOM = 1024  # edges kept free on reuse (root extras + grow()'s 256)
 _BATCH_SECONDS = 0.004  # target length of one mcts_run call
 
 _M64 = (1 << 64) - 1
@@ -629,9 +635,20 @@ class MCTS:
         found = self._jit_find(state)
         self._jstate = None
         t = self._tree
+        counted = None
         if t is not None and found is not None and t.ne0[found] >= 0 and t.npv[found] == 0:
             nodes, edges = _K.mcts_count(found, t.ne0, t.nne, t.ekid)
-            nt = _Tree(max(_NODES0, 2 * nodes), max(_EDGES0, 2 * edges + 256))
+            # the new arrays stay within the caps (mcts_compact writes without bounds
+            # checks): a subtree without room for the root extras is not reused
+            if nodes + 2 <= MAX_NODES and edges + _REUSE_EDGE_ROOM <= MAX_EDGES:
+                counted = nodes, edges
+        if counted is not None:
+            assert t is not None and found is not None
+            nodes, edges = counted
+            nt = _Tree(
+                min(MAX_NODES, max(_NODES0, 2 * nodes)),
+                min(MAX_EDGES, max(_EDGES0, 2 * edges + 256)),
+            )
             n2, e2 = _K.mcts_compact(
                 found, t.nn, t.nw, t.npv, t.ne0, t.nne, t.emv, t.epr, t.ekid,
                 nt.nn, nt.nw, nt.npv, nt.ne0, nt.nne, nt.emv, nt.epr, nt.ekid,

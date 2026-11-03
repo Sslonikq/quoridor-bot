@@ -276,6 +276,29 @@ def test_jit_equals_python_with_history_reuse_and_growth(monkeypatch):
     assert any(v > 150 for _, _, v, _ in jg)  # some trees were reused
 
 
+@needs_jit
+def test_jit_tree_stays_within_the_caps_on_reuse(monkeypatch):
+    """Report 0093 (review 0088 minor 3): repeated searches on one position (the analyzer
+    reuses the tree) never allocate arrays above MAX_NODES / MAX_EDGES; a kept tree
+    without room is dropped and the search still answers."""
+    monkeypatch.setattr(mcts_mod, "_NODES0", 64)
+    monkeypatch.setattr(mcts_mod, "_EDGES0", 512)
+    monkeypatch.setattr(mcts_mod, "MAX_NODES", 400)
+    monkeypatch.setattr(mcts_mod, "MAX_EDGES", 3000)
+    s = GameState.initial()
+    m = MCTS(0, MCTS_SEARCHER, "jit", **MCTS_OPTIONS)
+    visits = []
+    for _ in range(6):
+        r = m.search(s, sims=150)
+        t = m._tree
+        assert t.nn.size <= 400 and t.emv.size <= 3000
+        assert int(t.ctr[0]) <= t.nn.size and int(t.ctr[1]) <= t.emv.size
+        assert is_legal_move(s, r.move)
+        visits.append(r.visits)
+    assert max(visits) > 151  # reused at first
+    assert 151 in visits[2:]  # dropped once full: a fresh tree
+
+
 # ---------- step 4 (report 0083): lazy expansion, kept tree after a cancel ----------
 
 

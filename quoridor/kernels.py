@@ -2030,7 +2030,11 @@ def eg_search(m0, m1, m2, m3, m4, m5, m6, m7, hb, vb, u0, u1, w0, w1, p, r, limi
     """endgame._PyCore.root without recursion (numba cannot load a cached self-recursive
     function): the value of a depth-r search, the same nodes in the same order.
     ctr = [nodes, limit, aborted, best move of the root (-1: none)]; sm / si / sk: the
-    per-ply node stack (EG_FIELDS integer fields, masks + wall sets, TT key)."""
+    per-ply node stack (EG_FIELDS integer fields, masks + wall sets, TT key). The stack
+    holds plies 0..r: r beyond it raises ValueError (no bounds checks in numba)."""
+    rows = min(sm.shape[0], si.shape[0], sk.shape[0], mvbuf.shape[0], kbuf.shape[0])
+    if r < 0 or r >= rows:
+        raise ValueError("eg_search: depth outside the node stack")
     ctr[0] = 0
     ctr[1] = limit
     ctr[2] = 0

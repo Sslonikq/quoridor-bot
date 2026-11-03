@@ -301,32 +301,7 @@ _WALL_MOVES = tuple(WallMove(x, y, o) for x, y, o in bitpaths.WALL_OF_CODE)
 _PAWN_MOVES = tuple(PawnMove(i % 9, i // 9) for i in range(81))  # by bit index
 
 
-def _pawn_table() -> tuple[tuple[tuple[int, int, int, int, int, int, int], ...], ...]:
-    """Per bit index u: (d, n, jump, side1, t1, side2, t2) for the directions d (up, down,
-    right, left = the order of paths.DIRS and of the masks) with an on-board neighbour n:
-    the straight jump target and the two diagonal sides (mask index, target) in the
-    order of rules.pawn_moves_for. Off-board targets are never reached: the mask bit of
-    the step towards them is 0."""
-    dirs = ((0, 1), (0, -1), (1, 0), (-1, 0))
-    out = []
-    for u in range(81):
-        c, r = u % 9, u // 9
-        row = []
-        for d, (dc, dr) in enumerate(dirs):
-            nc, nr = c + dc, r + dr
-            if not (0 <= nc < 9 and 0 <= nr < 9):
-                continue
-            jc, jr = nc + dc, nr + dr
-            sides = []
-            for sc, sr in ((dr, dc), (-dr, -dc)):
-                sides += [dirs.index((sc, sr)), (nr + sr) * 9 + nc + sc]
-            j = jr * 9 + jc if 0 <= jc < 9 and 0 <= jr < 9 else -1
-            row.append((d, nr * 9 + nc, j, *sides))
-        out.append(tuple(row))
-    return tuple(out)
-
-
-_PAWN_TABLE = _pawn_table()
+_PAWN_TABLE = bitpaths.PAWN_TABLE  # old name (the table lives in bitpaths, report 0093)
 
 
 def pawn_moves_m(m: Masks, cell: Cell, opp: Cell) -> list[PawnMove]:

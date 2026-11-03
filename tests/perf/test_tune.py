@@ -122,6 +122,13 @@ def test_tune_main_runs(capsys):
     assert tune.main(["search:depth=1", "greedy", "--games", "4", "--procs", "2"]) == 0
     out = capsys.readouterr().out
     assert "n=4" in out and "dropped 0 game(s)" in out
+    assert out.count("seed 100 (processes 100..101)") == 2  # start line and result
+
+
+def test_seed_text_names_every_process_seed():
+    """Review 0088 nit 14: the log shows the seeds (the run can be repeated)."""
+    assert tune.seed_text(35500000, 8) == "seed 35500000 (processes 35500000..35500007)"
+    assert tune.seed_text(7, 1) == "seed 7 (processes 7)"
 
 
 def test_gap_limit_follows_the_move_budget():

@@ -230,6 +230,47 @@ def test_win_now_and_score_scale():
     assert eg.plies_of_score(res.score) == -14
 
 
+@pytest.mark.parametrize("core", CORES)
+def test_depth_beyond_the_node_stack_is_an_error(core):
+    """Review 0088 nit 10: the kernel has no bounds checks, so the depth is checked
+    against its node stack (both cores the same)."""
+    s = st((4, 1), (4, 7), WHITE, (1, 1))
+    impl = EndgameSolver(tt_bits=10, core=core)._core()
+    args = (*eg._encode(s), *s.walls_left, s.turn)
+    for r in (-1, eg.STACK, eg.STACK + 50):
+        with pytest.raises(ValueError):
+            impl.root(*args, r, 100)
+    assert eg.MAX_DEPTH < eg.STACK
+    v, _, nodes, aborted = impl.root(*args, eg.STACK - 1, 100)  # the last row still fits
+    assert aborted and nodes > 0 and v == 0
+
+
+@pytest.mark.parametrize("core", CORES)
+def test_explicit_chunk_without_a_budget_stops(core):
+    """Review 0088 nit 11: a chunk too small to ever finish a depth, no clock and no node
+    budget: at most MAX_REPEATS calls per depth, then 'unknown' (was an endless loop)."""
+    s = st((4, 1), (4, 7), WHITE, (2, 2))
+    res = EndgameSolver(tt_bits=10, core=core).solve(s, chunk=1)
+    assert not res.proven and res.move is None
+    assert res.nodes <= eg.MAX_REPEATS * (res.depth + 1)
+
+
+def test_cancel_chunk_is_smaller():
+    """Review 0088 minor 4: with should_stop the jit calls are short (analyzer cancel)."""
+    assert eg.CANCEL_CHUNK["jit"] <= eg.CHUNK["jit"] // 4
+    calls = []
+
+    class Spy(eg._PyCore):
+        def root(self, *a):
+            calls.append(a[-1])
+            return super().root(*a)
+
+    sol = EndgameSolver(tt_bits=10, core="py")
+    sol._impl = Spy(10)
+    sol.solve(st((4, 1), (4, 7), WHITE, (1, 1)), should_stop=lambda: False, max_depth=6)
+    assert calls and max(calls) == eg.CANCEL_CHUNK["py"]
+
+
 # ---------- known endgames (fixture) ----------
 
 

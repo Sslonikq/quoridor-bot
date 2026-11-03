@@ -150,11 +150,12 @@ def _score_white(state: GameState, score: int) -> int:
 # Tree reuse between analyses (report 0083): one MCTS kept between requests. A position
 # equal to the last analysed one, its child or its grandchild (the next move or two typed
 # in, a time mode switch) continues that tree; anything else starts a new one inside
-# MCTS.search. The lock serialises the searches; a request that cannot get it soon (the
-# cancelled older search finishes within a batch of a few ms) searches with its own
-# fresh MCTS.
+# MCTS.search. The lock serialises the searches; a request that cannot get it within
+# _MCTS_WAIT searches with its own fresh MCTS. A cancelled older search lets go after one
+# simulation batch (a few ms) or, in the endgame solver at the root (both sides <= 2
+# walls), after one call of endgame.CANCEL_CHUNK nodes (at most ~0.35 s, report 0093).
 _MCTS_LOCK = threading.Lock()
-_MCTS_WAIT = 1.0  # seconds to wait for the shared tree
+_MCTS_WAIT = 1.0  # seconds to wait for the shared tree (> the cancel latency above)
 _mcts_shared: MCTS | None = None
 
 

@@ -40,11 +40,17 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from quoridor import jit as _jit
-from quoridor.bitpaths import GOAL_MASK, build_masks, m8, py_distance, py_shortest_layers
+from quoridor.bitpaths import (
+    GOAL_MASK,
+    PAWN_TABLE,
+    build_masks,
+    m8,
+    py_distance,
+    py_shortest_layers,
+)
 from quoridor.bitpaths import wall_bits as _wall_bits
 from quoridor.eval import WIN
 from quoridor.rules import pawn_moves, winner
-from quoridor.search import _PAWN_TABLE
 from quoridor.state import GameState, H, Move, PawnMove, WallMove, goal_row
 
 _K = _jit.kernels()
@@ -57,6 +63,7 @@ EXACT, LOWER, UPPER = 0, 1, 2
 TT_BITS = 20  # 2**20 entries, 17 bytes each (~18 MB)
 MAX_DEPTH = 160  # plies; deeper is never needed with <= 2 walls each
 MAX_PLY = MAX_DEPTH + 2
+STACK = MAX_PLY + 2  # node stack rows of the jit core: depths 0..STACK - 1
 WALL_MOVE = 128  # move code: 0..80 a pawn step to that cell, 128 + wall code a wall
 CORES = ("jit", "py")
 
@@ -232,6 +239,8 @@ class _PyCore:
 
     def root(self, m, hb, vb, u0, u1, w0, w1, p, r, limit) -> tuple[int, int, int, bool]:
         """(value, best move code or -1, nodes, aborted) of a depth-r search."""
+        if r < 0 or r >= STACK:
+            raise ValueError("eg_search: depth outside the node stack")  # as the kernel
         self.nodes = 0
         self.limit = limit
         self.aborted = False
@@ -255,7 +264,7 @@ class _PyCore:
         else:
             u, o, goal = u1, u0, 0
         pm = []
-        for d, n, j, s1, t1, s2, t2 in _PAWN_TABLE[u]:
+        for d, n, j, s1, t1, s2, t2 in PAWN_TABLE[u]:
             if not m[d] >> u & 1:
                 continue
             if n != o:
@@ -424,12 +433,12 @@ class _JitCore:
         self.tf = np.zeros(size, dtype=np.int8)
         self.tm = np.zeros(size, dtype=np.int16)
         self.ctr = np.zeros(4, dtype=np.int64)
-        self.mvbuf = np.zeros((MAX_PLY + 2, 256), dtype=np.int64)
-        self.kbuf = np.zeros((MAX_PLY + 2, 256), dtype=np.int64)
+        self.mvbuf = np.zeros((STACK, 256), dtype=np.int64)
+        self.kbuf = np.zeros((STACK, 256), dtype=np.int64)
         self.lay = np.zeros((4, 82), dtype=np.uint64)
-        self.sm = np.zeros((MAX_PLY + 2, 10), dtype=np.uint64)
-        self.si = np.zeros((MAX_PLY + 2, _K.EG_FIELDS), dtype=np.int64)
-        self.sk = np.zeros(MAX_PLY + 2, dtype=np.uint64)
+        self.sm = np.zeros((STACK, 10), dtype=np.uint64)
+        self.si = np.zeros((STACK, _K.EG_FIELDS), dtype=np.int64)
+        self.sk = np.zeros(STACK, dtype=np.uint64)
 
     def root(self, m, hb, vb, u0, u1, w0, w1, p, r, limit) -> tuple[int, int, int, bool]:
         assert _K is not None
@@ -462,7 +471,11 @@ class SolverCancelled(Exception):
     """solve() stopped by should_stop()."""
 
 
-CHUNK = {"jit": 1 << 18, "py": 1 << 11}  # nodes per kernel call with a clock (~0.1-0.2 s)
+CHUNK = {"jit": 1 << 18, "py": 1 << 11}  # nodes per kernel call with a clock (~0.1-1.2 s)
+# with should_stop (the analyzer): a cancel waits for one call, at most ~0.35 s with 2^16
+# (report 0093; 2^18: up to 1.2 s, above engine._MCTS_WAIT); +0.1% nodes on the fixture
+CANCEL_CHUNK = {"jit": 1 << 16, "py": 1 << 11}
+MAX_REPEATS = 256  # calls per depth without a time or node budget (a chunk without a clock)
 
 
 class EndgameSolver:
@@ -499,11 +512,13 @@ class EndgameSolver:
         time budget runs out (then plies = 0).
 
         With a clock (time_limit or should_stop) every kernel call gets at most `chunk`
-        nodes (default CHUNK of the core); a call cut by its chunk is repeated on the
-        same depth (the TT keeps the finished subtrees), so the clock and should_stop()
-        are checked every chunk. should_stop() true raises SolverCancelled. Without a
-        clock and chunk: one call per depth, deterministic for max_nodes (the same in both
-        cores; so is any fixed chunk)."""
+        nodes (default CANCEL_CHUNK with should_stop, else CHUNK of the core); a call cut
+        by its chunk is repeated on the same depth (the TT keeps the finished subtrees),
+        so the clock and should_stop() are checked every chunk. should_stop() true raises
+        SolverCancelled. Without time_limit and max_nodes a depth gets at most MAX_REPEATS
+        calls (the TT may not keep enough of the tree to finish it): then plies = 0.
+        Without a clock and chunk: one call per depth, deterministic for max_nodes (the
+        same in both cores; so is any fixed chunk)."""
         if winner(state) is not None:
             raise ValueError("terminal position")
         t0 = time.perf_counter()
@@ -515,12 +530,20 @@ class EndgameSolver:
         core = self._core()
         w0, w1 = state.walls_left
         deadline = None if time_limit is None else t0 + time_limit
-        if chunk is None and (deadline is not None or should_stop is not None):
-            chunk = CHUNK[self.core]
+        if chunk is None:
+            if should_stop is not None:
+                chunk = CANCEL_CHUNK[self.core]
+            elif deadline is not None:
+                chunk = CHUNK[self.core]
+        unbounded = deadline is None and max_nodes is None
         total = 0
         done = 0
         for r in range(1, max(1, min(max_depth, MAX_DEPTH)) + 1):
+            calls = 0
             while True:
+                if unbounded and calls >= MAX_REPEATS:
+                    return SolveResult(None, 0, done, total, time.perf_counter() - t0)
+                calls += 1
                 if should_stop is not None and should_stop():
                     raise SolverCancelled
                 if deadline is not None and time.perf_counter() >= deadline:
