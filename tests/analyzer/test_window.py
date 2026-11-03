@@ -105,3 +105,39 @@ def test_minimized_maximized_and_tiny_geometry_is_not_saved(tmp_path):
     api.on_resized(1920, 1080)
     assert st.get()["full_size"] == [900, 700]
     api.flush()
+
+
+# --- phase 12 minors (report 0113) ---
+
+
+def test_offscreen_minimized_coordinates_are_ignored_in_normal_state(tmp_path):
+    """-32000 (Windows 'minimized' position) is dropped even without any state event."""
+    st = SettingsStore(tmp_path / "a.json")
+    api = window.WindowApi(st)
+    api.on_moved(100, 50)
+    api.on_moved(-32000, -32000)
+    api.on_moved(-32000, 10)
+    api.on_moved(10, -32000)
+    assert (st.get()["x"], st.get()["y"]) == (100, 50)
+    api.flush()
+
+
+def test_fresh_api_offscreen_position_keeps_default(tmp_path):
+    st = SettingsStore(tmp_path / "a.json")
+    before = (st.get()["x"], st.get()["y"])
+    api = window.WindowApi(st)
+    api.on_moved(-32000, -32000)
+    assert (st.get()["x"], st.get()["y"]) == before
+    api.flush()
+
+
+def test_second_monitor_on_the_left_is_saved_at_boundary(tmp_path):
+    st = SettingsStore(tmp_path / "a.json")
+    api = window.WindowApi(st)
+    api.on_moved(-29999, 0)
+    assert (st.get()["x"], st.get()["y"]) == (-29999, 0)
+    api.on_moved(-1920, 0)
+    assert (st.get()["x"], st.get()["y"]) == (-1920, 0)
+    api.on_moved(-30000, 0)  # the filter is inclusive: -30000 is dropped
+    assert st.get()["x"] == -1920
+    api.flush()

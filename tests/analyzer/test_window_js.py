@@ -218,3 +218,15 @@ def test_pin_api_error_keeps_state():
         "a"
     ]
     assert r["pinPressed"] == "false"
+
+
+def test_late_ready_window_settings_replace_stored_compact():
+    """Browser mode restored compact=1 from localStorage; a late pywebviewready then takes
+    the compact flag from analyzer.json (the window is the source of truth)."""
+    r = run(
+        storedCompact="1",
+        settings={"on_top": False, "compact": False},
+        script=["wait:700", "snap:before", "late", "snap:after"],
+    )["snaps"]
+    assert r["before"]["compact"] is True
+    assert r["after"]["compact"] is False and r["after"]["compactPressed"] == "false"

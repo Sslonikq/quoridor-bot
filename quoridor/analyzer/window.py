@@ -55,13 +55,17 @@ def set_window_on_top(window: Any, value: bool) -> None:
     thread that recreates the window handle across threads and deadlocks the UI ("Not
     responding"). So on WinForms the assignment is marshalled to the UI thread with
     Control.Invoke; elsewhere (or if that is not possible) the plain property is used.
+
+    The WinForms path bypasses the Window.on_top setter, so window.on_top goes stale: read the
+    pin state from SettingsStore, never from window.on_top.
     """
     try:
         from System import Func, Type  # type: ignore[import-not-found]
-        from webview.platforms.winforms import BrowserView  # type: ignore[import-not-found]
 
-        form = BrowserView.instances.get(window.uid)
-    except Exception:  # not WinForms (other OS / backend) or an API change
+        # Do not import the WinForms module: if it is not loaded, the backend is not WinForms.
+        winforms = sys.modules.get("webview.platforms.winforms")
+        form = winforms.BrowserView.instances.get(window.uid) if winforms else None
+    except Exception:  # no pythonnet (other OS / backend) or an API change
         form = None
     if form is None:
         window.on_top = value
@@ -70,7 +74,10 @@ def set_window_on_top(window: Any, value: bool) -> None:
     def apply() -> None:
         form.TopMost = value
 
-    form.Invoke(Func[Type](apply))
+    try:
+        form.Invoke(Func[Type](apply))
+    except Exception as e:  # form closing/disposed; the value is already in the store
+        print(f"Предупреждение: не удалось закрепить окно ({e})", file=sys.stderr)
 
 
 class WindowApi:
