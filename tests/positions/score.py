@@ -49,7 +49,14 @@ from quoridor.notation import format_move, parse_move
 from quoridor.paths import shortest_path_length
 from quoridor.rules import apply_move_unchecked, is_legal_move, pawn_moves, winner
 from quoridor.state import GameState, H, Move, PawnMove, WallMove
-from tests.positions.loader import Position, game_moves, load_positions, state_at
+from tests.positions.loader import (
+    DATA,
+    LIVE_DATA,
+    Position,
+    game_moves,
+    load_positions,
+    state_at,
+)
 
 REPO = Path(__file__).resolve().parents[2]
 OUT_DIR = REPO / "arena_results" / "positions"  # in .gitignore
@@ -278,7 +285,9 @@ def evaluate(
 
 def _job(args: tuple[str, float, str, int, Budget | None]) -> Verdict:
     bot_name, seconds, pid, seed, budget = args
-    pos = next(p for p in load_positions(validate=False) if p.id == pid)
+    pos = next(
+        p for path in (DATA, LIVE_DATA) for p in load_positions(path, validate=False) if p.id == pid
+    )
     return evaluate(bot_name, seconds, pos, seed, budget)
 
 
@@ -512,6 +521,12 @@ def main(argv: list[str] | None = None) -> int:
         type=int,
         help="runs; the result is the median share (default 3, with --budget 1)",
     )
+    ap.add_argument(
+        "--set",
+        choices=("real", "live", "all"),
+        default="real",
+        help="position set: real (phase 9, default), live (phase 14, live games) or all",
+    )
     ap.add_argument("--only", help="comma-separated position ids")
     ap.add_argument("--procs", type=int, default=1, help="processes (timing noise grows)")
     ap.add_argument("--out", type=Path, help="result JSON (default arena_results/positions/...)")
@@ -531,7 +546,11 @@ def main(argv: list[str] | None = None) -> int:
     runs_n = args.runs if args.runs is not None else (1 if budget else 3)
     if runs_n < 1:
         ap.error("--runs must be >= 1")
-    positions = load_positions()
+    positions = []
+    if args.set in ("real", "all"):
+        positions += load_positions(DATA)
+    if args.set in ("live", "all"):
+        positions += load_positions(LIVE_DATA)
     if args.only:
         want = set(args.only.split(","))
         positions = [p for p in positions if p.id in want]

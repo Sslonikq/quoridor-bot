@@ -16,6 +16,7 @@ from quoridor.state import GameState
 
 HERE = Path(__file__).parent
 DATA = HERE / "positions.json"
+LIVE_DATA = HERE / "live_positions.json"  # phase 14: live games 08-12 (reports 0123, 0124)
 GAMES = HERE.parent / "fixtures" / "games"
 
 SIDES = {"white": 0, "black": 1}
