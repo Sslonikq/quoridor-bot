@@ -230,3 +230,64 @@ def test_late_ready_window_settings_replace_stored_compact():
     )["snaps"]
     assert r["before"]["compact"] is True
     assert r["after"]["compact"] is False and r["after"]["compactPressed"] == "false"
+
+
+# --- "Новая доска" (report 0118) ---
+
+SEED = "eval:line.push('e2','e8'); ply = 2; mainLine = ['e2','e8','e3']"
+
+
+def state(snap):
+    return json.loads(snap["state"])
+
+
+def test_new_board_empty_resets_immediately():
+    r = run(script=["wait:100", "click:bNew", "wait:100", "snap:a"])["snaps"]["a"]
+    assert state(r)["line"] == [] and r["armed"] is False
+
+
+def test_new_board_with_moves_needs_confirmation():
+    r = run(script=["wait:100", SEED, "click:bNew", "snap:armed"])["snaps"]["armed"]
+    assert r["armed"] is True and state(r)["line"] == ["e2", "e8"]
+
+
+def test_new_board_second_click_resets_everything():
+    n_before = run(script=["wait:100", SEED, "snap:s"])["snaps"]["s"]
+    r = run(script=["wait:100", SEED, "click:bNew", "click:bNew", "wait:100", "snap:a"])["snaps"][
+        "a"
+    ]
+    st = state(r)
+    assert st["line"] == [] and st["ply"] == 0 and st["mainLine"] is None
+    assert r["armed"] is False
+    assert state(n_before)["aseq"] < st["aseq"]  # the old analysis is invalidated
+
+
+def test_new_board_asks_server_for_start_position_without_cancel_race():
+    r = run(script=["wait:100", SEED, "click:bNew", "click:bNew", "wait:100", "snap:a"])["snaps"][
+        "a"
+    ]
+    paths = [f[0] for f in r["fetches"]]
+    last_state = [f for f in r["fetches"] if f[0] == "/api/state"][-1]
+    assert last_state[1] == {"moves": []}
+    assert "/api/cancel" not in paths  # a late cancel could kill the new analysis
+
+
+def test_new_board_escape_disarms():
+    s = run(script=["wait:100", SEED, "click:bNew", "key:Escape", "snap:a"])["snaps"]["a"]
+    assert s["armed"] is False and state(s)["line"] == ["e2", "e8"]
+
+
+def test_new_board_disarms_by_timeout():
+    s = run(script=["wait:100", SEED, "click:bNew", "wait:4300", "snap:a"])["snaps"]["a"]
+    assert s["armed"] is False and state(s)["line"] == ["e2", "e8"]
+
+
+@pytest.mark.parametrize("key", ["n", "N", "т", "Т"])
+def test_new_board_hotkey(key):
+    s = run(script=["wait:100", SEED, f"key:{key}", "snap:a"])["snaps"]["a"]
+    assert s["armed"] is True
+
+
+def test_new_board_hotkey_resets_when_empty():
+    s = run(script=["wait:100", "key:n", "wait:100", "snap:a"])["snaps"]["a"]
+    assert s["armed"] is False

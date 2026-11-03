@@ -346,8 +346,9 @@ def test_not_reachable_through_a_non_loopback_address(server):
 
 
 def test_static_dir_has_no_external_urls():
-    files = [p for p in STATIC_DIR.rglob("*") if p.is_file()]
-    assert {p.name for p in files} >= {"index.html", "app.js", "app.css"}
+    all_files = [p for p in STATIC_DIR.rglob("*") if p.is_file()]
+    assert {p.name for p in all_files} >= {"index.html", "app.js", "app.css"}
+    files = [p for p in all_files if p.suffix in (".html", ".js", ".css")]  # png is binary
     for p in files:
         text = p.read_text("utf-8")
         text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)  # comments

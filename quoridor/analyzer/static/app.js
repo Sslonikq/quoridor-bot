@@ -470,9 +470,29 @@ $("bHint").onclick = () => {
 };
 for (const k in MODES) $("mode_" + k).onclick = () => setMode(k);
 for (const k in BOTS) $("bot_" + k).onclick = () => setBot(k);
-$("bNew").onclick = () => {
+// «Новая доска»: если ходы есть, первый клик «взводит» кнопку (подпись «Стереть партию?»), второй в течение
+// 4 с подтверждает. Встроенное подтверждение вместо window.confirm, который в pywebview может не работать.
+let newArmed = null;
+function disarmNew() {
+  if (newArmed) { clearTimeout(newArmed); newArmed = null; }
+  $("bNew").classList.toggle("armed", false);
+}
+function newBoard() {
+  disarmNew();
   if (rv) { if (reviewRunning()) api("/api/review/cancel", {}).catch(() => {}); rv = null; }
-  line = []; ply = 0; mainLine = null; fromLoad = false; lastEval = null; $("loadMsg").textContent = ""; refresh();
+  // Анализ не гасим отдельным /api/cancel: refresh сам запустит новый /api/analyze, который отменяет старый
+  // на сервере; запоздавший cancel мог бы убить именно новый расчёт (см. stopAnalysis).
+  stopAnalysis(false);
+  line = []; ply = 0; mainLine = null; fromLoad = false; lastEval = null; hover = null;
+  okLine = []; okPly = 0;
+  $("loadMsg").textContent = ""; $("loadMsg").className = "msg";
+  refresh();
+}
+$("bNew").onclick = () => {
+  if (!line.length && !mainLine) { newBoard(); return; }
+  if (newArmed) { newBoard(); return; }
+  $("bNew").classList.toggle("armed", true);
+  newArmed = setTimeout(disarmNew, 4000);
 };
 $("bRestore").onclick = () => { if (!mainLine) return; line = mainLine; mainLine = null; ply = Math.min(ply, line.length); refresh(); toast("Партия восстановлена"); };
 $("bCopy").onclick = () => {
@@ -493,6 +513,7 @@ $("bLoad").onclick = async () => {
 $("bReview").onclick = () => { if (reviewRunning()) stopReview(); else startReview(); };
 document.addEventListener("keydown", e => {
   if (e.ctrlKey || e.metaKey || e.altKey) return;
+  if (e.key === "Escape" && newArmed) { disarmNew(); e.preventDefault(); return; }
   if (e.key === "Escape" && live) { cancelAnalysis(); e.preventDefault(); return; }
   if (e.target.tagName === "TEXTAREA" || e.target.tagName === "INPUT") return;
   const k = e.key;
@@ -503,6 +524,7 @@ document.addEventListener("keydown", e => {
   else if (k === "Backspace") { $("bUndo").click(); e.preventDefault(); }
   else if (k === "f" || k === "F" || k === "а" || k === "А") $("bFlip").click();
   else if (k === "h" || k === "H" || k === "р" || k === "Р") $("bHint").click();
+  else if (k === "n" || k === "N" || k === "т" || k === "Т") $("bNew").click();
   else if (k === "c" || k === "C" || k === "с" || k === "С") $("bCompact").click();
 });
 refresh();
@@ -513,6 +535,8 @@ const COMPACT_KEY = "quoridor.analyzer.compact";
 let native = null;        // window.pywebview.api, когда есть окно
 function applyCompact(on) {
   document.body.classList.toggle("compact", on);
+  // в компакте обрезаем поля рамки вокруг клеток (24 -> 8 ед.); pick() берёт координаты из getScreenCTM, так что клики не смещаются
+  svg.setAttribute("viewBox", on ? "16 16 568 568" : "0 0 600 600");
   $("bCompact").setAttribute("aria-pressed", String(on));
   $("bCompact").classList.toggle("on", on);
   render();

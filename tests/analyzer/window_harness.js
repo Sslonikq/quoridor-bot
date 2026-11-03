@@ -4,7 +4,7 @@
 // Actions: wait:MS, snap:NAME, late (pywebview appears + pywebviewready), key:X, click:ID.
 const vm = require("vm"), fs = require("fs");
 const cfg = JSON.parse(process.argv[3] || "{}");
-const apiCalls = [], store = new Map(), readyHandlers = [];
+const fetchLog = [], apiCalls = [], store = new Map(), readyHandlers = [];
 let keyHandler = null;
 
 function stub(id) {
@@ -48,7 +48,7 @@ const ctx = { document: doc, window: win, location: { search: cfg.search || "" }
   getComputedStyle: () => ({ getPropertyValue: () => "#000" }), navigator: {},
   localStorage: { getItem: k => (store.has(k) ? store.get(k) : null), setItem: (k, v) => store.set(k, String(v)) },
   setTimeout, clearTimeout, setInterval, clearInterval, Date, console, AbortController, Math, JSON,
-  fetch: async path => ({ json: async () => (path === "/api/state" ? { ok: true, position: POS } : { ok: true, cancelled: true }) }) };
+  fetch: async (path, o) => { fetchLog.push([path, o && o.body ? JSON.parse(o.body) : null]); return ({ json: async () => (path === "/api/state" ? { ok: true, position: POS } : { ok: true, cancelled: true }) }); } };
 if (cfg.storedCompact !== undefined) store.set("quoridor.analyzer.compact", cfg.storedCompact);
 vm.createContext(ctx);
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -58,6 +58,9 @@ const snap = () => ({
   compact: body.classList.contains("compact"), compactPressed: get("bCompact").getAttribute("aria-pressed"),
   stored: store.get("quoridor.analyzer.compact") === undefined ? null : store.get("quoridor.analyzer.compact"),
   calls: apiCalls.map(c => c.slice()),
+  fetches: fetchLog.map(c => c.slice()),
+  armed: get("bNew").classList.contains("armed"),
+  state: vm.runInContext("JSON.stringify({line, ply, mainLine, aseq})", ctx),
 });
 (async () => {
   vm.runInContext(fs.readFileSync(process.argv[2], "utf8"), ctx);
@@ -68,6 +71,7 @@ const snap = () => ({
     else if (op === "snap") snaps[arg] = snap();
     else if (op === "late") { win.pywebview = { api }; readyHandlers.forEach(f => f()); await sleep(50); }
     else if (op === "key") { keyHandler({ key: arg, target: {}, preventDefault() {} }); await sleep(30); }
+    else if (op === "eval") { vm.runInContext(arg, ctx); }
     else if (op === "click") { await get(arg).onclick({}); await sleep(30); }
   }
   console.log(JSON.stringify({ snaps, readyHandlers: readyHandlers.length }));

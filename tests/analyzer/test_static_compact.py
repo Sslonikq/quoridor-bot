@@ -59,3 +59,21 @@ def test_mode_and_bot_containers_are_not_full_only():
         open_tag = text.rindex("<span", 0, pos)
         tag = text[open_tag : text.index(">", open_tag)]
         assert "full-only" not in tag, tag
+
+
+def test_new_board_button_available_in_compact():
+    found = {f[0]: f for f in _parse()}
+    _, own, ancestors = found["bNew"]
+    assert "full-only" not in own and "full-only" not in ancestors
+    assert "newAsk" in found
+
+
+def test_board_enlarged_in_compact_without_hardcoded_pick():
+    """Report 0121: the compact board is cropped via viewBox, clicks use getScreenCTM."""
+    js = (INDEX.parent / "app.js").read_text(encoding="utf-8")
+    css = (INDEX.parent / "app.css").read_text(encoding="utf-8")
+    assert 'svg.setAttribute("viewBox", on ?' in js
+    assert "getScreenCTM().inverse()" in js
+    assert "body.compact svg#board" in css
+    assert "aspect-ratio:1/1" in css
+    assert 'id="evalbar"' in INDEX.read_text(encoding="utf-8")

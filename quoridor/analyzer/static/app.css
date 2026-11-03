@@ -89,22 +89,51 @@ button.busy{border-color:var(--hint);color:var(--hint)}
 #deepProg{margin-top:6px}
 .seg{display:inline-flex;gap:0}.seg button{border-radius:0;margin-left:-1px}.seg button:first-child{border-radius:6px 0 0 6px;margin-left:0}.seg button:last-child{border-radius:0 6px 6px 0}
 
-/* ---------- Окно: кнопки управления и компактный режим (~380 px) ---------- */
+/* ---------- Окно: кнопки управления и компактный режим (~400 px) ---------- */
 .winctl{display:inline-flex;gap:6px;margin-left:auto}
 button.icon[hidden],#winNote[hidden]{display:none}
 #bPin[aria-pressed=true]{border-color:var(--hint);color:var(--hint)}
 #winNote{max-width:1120px;margin:8px auto 0;padding:0 16px}
-body.compact{padding-block:8px 12px;padding-left:8px;padding-right:8px;font-size:13px}
-body.compact .wrap{max-width:380px;gap:8px}
-body.compact .full-only,body.compact header h1,body.compact .lbl,body.compact kbd,body.compact #winNote{display:none}
-body.compact .main{grid-template-columns:minmax(0,1fr);gap:8px}
-body.compact .left,body.compact .side{gap:8px}
-body.compact .card{padding:8px;gap:6px}
-body.compact .toolbar{gap:4px}
-body.compact .bm{grid-template-columns:20px 54px 1fr auto;gap:6px;padding:5px 7px}
-body.compact header{gap:4px}
+#bNew .ask{display:none}
+#bNew.armed{border-color:var(--bad);color:var(--bad)}
+#bNew.armed .ask{display:inline}
+#bNew.armed .ico,#bNew.armed .lbl,#bNew.armed kbd{display:none}
 
-/* компактный режим: время подсказки (2/10/30 с) и бот в одной строке */
-body.compact .seg kbd{display:inline;border:0;margin:0;padding:0;color:inherit}
-body.compact .seg button{padding:5px 8px}
-body.compact .toolbar{justify-content:space-between}
+body.compact{padding-block:12px 14px;padding-left:6px;padding-right:6px;font-size:14px;min-height:100vh;box-sizing:border-box;display:flex;flex-direction:column}
+body.compact .wrap{max-width:520px;width:100%;gap:12px;flex:1}
+body.compact .full-only,body.compact header h1,body.compact .lbl,body.compact kbd,body.compact #winNote{display:none}
+body.compact #bNew.armed kbd{display:none}
+body.compact header{gap:6px;justify-content:flex-end}
+body.compact .main{display:flex;flex-direction:column;gap:12px;flex:1}
+body.compact .left{gap:12px}
+body.compact .side{gap:12px;flex:1}
+body.compact .card{padding:12px 14px;gap:10px}
+body.compact .card h2{font-size:12px}
+body.compact .status{gap:8px 12px;font-size:14px}
+body.compact .turn{font-size:14px}
+
+/* кнопки: крупные цели клика, три ряда (навигация и действия / время / бот) */
+body.compact button{min-height:40px;padding:8px 12px;font-size:14px}
+body.compact .toolbar{gap:8px;justify-content:stretch}
+body.compact .toolbar>button:not(.full-only){flex:1 1 0}
+body.compact .winctl button{min-width:44px;min-height:40px}
+body.compact .seg{display:flex;flex:1 1 100%;width:100%}
+body.compact .seg button{flex:1 1 0;padding:8px 6px}
+body.compact .seg kbd{display:inline;border:0;margin:0;padding:0;color:inherit;font-size:14px}
+
+/* шкала оценки уже, доске больше ширины */
+body.compact .boardrow{gap:4px}
+body.compact .evalbar{width:16px}
+/* доска: во всю ширину, квадрат, по высоте не больше доступного (ниже остаётся «Лучшие ходы») */
+body.compact .boardbox{display:flex;justify-content:center}
+body.compact svg#board{width:min(100%,max(260px,calc(100vh - 400px)));aspect-ratio:1/1;height:auto}
+body.compact .evalbar .num{font-size:10px;writing-mode:vertical-rl;left:0;right:0}
+
+/* «Лучшие ходы» занимают свободную высоту окна */
+body.compact .side .card:nth-child(2){flex:1}
+body.compact .best{flex:1;gap:8px;align-content:start}
+body.compact .bm{grid-template-columns:22px 60px 1fr auto;gap:10px;padding:11px 12px}
+body.compact .bm .mv{font-size:16px}
+body.compact .bm .why{font-size:13px;white-space:normal;line-height:1.3}
+body.compact .bm .ev{font-size:15px}
+body.compact .msg{font-size:13px;line-height:1.4}

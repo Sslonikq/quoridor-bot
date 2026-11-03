@@ -14,6 +14,7 @@ import functools
 import importlib
 import sys
 import threading
+from pathlib import Path
 from types import ModuleType
 from typing import Any
 
@@ -21,6 +22,20 @@ from quoridor.analyzer.settings import MIN_SIZE, SettingsStore
 
 TITLE = "Анализатор Коридора"
 SAVE_DELAY = 0.5  # seconds: move/resize events come in bursts
+
+
+def icon_path() -> str | None:
+    """Path of assets/icon.ico: next to the sources, or in the frozen bundle (sys._MEIPASS/assets).
+    None if the file is missing (the window then opens with the default icon)."""
+    roots = []
+    if getattr(sys, "_MEIPASS", None):
+        roots.append(Path(sys._MEIPASS))
+    roots.append(Path(__file__).resolve().parents[2])
+    for root in roots:
+        p = root / "assets" / "icon.ico"
+        if p.is_file():
+            return str(p)
+    return None
 
 
 def load_webview() -> ModuleType | None:
@@ -197,7 +212,11 @@ def run_native(
         if event is not None:
             event += functools.partial(api.on_state, name)
     try:
-        webview_module.start()
+        icon = icon_path()
+        if icon:
+            webview_module.start(icon=icon)
+        else:
+            webview_module.start()
     finally:
         api.flush()
     return api

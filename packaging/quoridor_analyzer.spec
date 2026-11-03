@@ -5,7 +5,8 @@ import os
 from PyInstaller.utils.hooks import collect_all, collect_submodules
 
 ROOT = os.path.abspath(os.path.join(SPECPATH, ".."))
-datas = [(os.path.join(ROOT, "quoridor", "analyzer", "static"), "quoridor/analyzer/static")]
+datas = [(os.path.join(ROOT, "quoridor", "analyzer", "static"), "quoridor/analyzer/static"),
+         (os.path.join(ROOT, "assets", "icon.ico"), "assets")]
 binaries = []
 hiddenimports = collect_submodules("quoridor")
 for pkg in ("numba", "llvmlite", "webview", "clr_loader", "pythonnet"):

@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Анализатор Коридора</title>
+<link rel="icon" type="image/png" href="favicon.png">
 <link rel="stylesheet" href="/app.css">
 </head>
 <body>
@@ -27,6 +28,7 @@
         <span class="sep full-only"></span>
         <button id="bUndo" title="Отменить ход (Backspace)">↶<span class="lbl"> Отменить</span><kbd>⌫</kbd></button>
         <button id="bFlip" title="Перевернуть доску (F)">⇅<span class="lbl"> Перевернуть</span><kbd>F</kbd></button>
+        <button id="bNew" title="Новая доска: начальная позиция (N). Если ходы есть, нажмите второй раз для подтверждения"><span class="ico">＋</span><span class="lbl"> Новая доска</span><kbd>N</kbd><span class="ask" id="newAsk">Стереть партию?</span></button>
         <button class="full-only on" id="bHint" title="Подсказка (H)">💡<span class="lbl" id="hintLbl"> Подсказка: вкл</span><kbd>H</kbd></button>
         <span class="seg" role="group" aria-label="Время подсказки">
           <button id="mode_fast" title="Быстро: 2 с на позицию"><span class="lbl">Быстро</span><kbd>2 с</kbd></button>
@@ -70,7 +72,7 @@
         <div class="moves" id="moves"></div>
         <div class="mvinfo" id="mvInfo"></div>
         <div class="summary" id="summary"></div>
-        <div class="toolbar"><button id="bRestore" hidden>Вернуть партию</button><button id="bCopy">Копировать ходы</button><button id="bNew">Новая доска</button></div>
+        <div class="toolbar"><button id="bRestore" hidden>Вернуть партию</button><button id="bCopy">Копировать ходы</button></div>
       </div>
       <div class="card load-card full-only">
         <h2>Загрузить и разобрать партию</h2>
