@@ -43,6 +43,7 @@ def test_mode_and_bot_switches_are_not_full_only():
         "mode_normal",
         "mode_deep",
         "bot_mcts",
+        "bot_mcts4",
         "bot_v5",
         "bot_v4",
     }

@@ -128,6 +128,12 @@ def test_bot_switch_sends_the_bot_remembers_it_and_restarts(result):
     assert result["botBack"] == ["mcts"]
 
 
+def test_mcts4_bot_is_sent_remembered_and_shown_like_mcts(result):
+    assert result["bot4Bodies"] == ["mcts4"] and result["bot4Stored"] == "mcts4"
+    assert result["bot4Mark"] == "mcts4" and result["loadedBot4"] == "mcts4"
+    assert "MCTS4" in result["bot4Msg"] and "1234 симуляций" in result["bot4Msg"]
+
+
 def test_bot_is_loaded_from_local_storage_with_a_safe_default(result):
     assert result["loadedBotV4"] == "v4"
     assert result["loadedBotBogus"] == result["loadedBotProto"] == "mcts"

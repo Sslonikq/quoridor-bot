@@ -480,3 +480,21 @@ def test_mcts_cancel_stops_within_a_simulation_and_progress_is_reported():
     )
     assert res["cancelled"] and res["top"] == [] and time.perf_counter() - t0 < 2
     assert seen and seen[-1][1] > 0 and seen[-1][0] >= 1
+
+
+def test_mcts4_button_uses_the_registry_mcts4_with_its_own_tree():
+    """Phase 14: bot "mcts4" = bots.MCTS4_SEARCHER / MCTS4_OPTIONS; "mcts" stays mcts3; the kept
+    trees of the two bots are separate."""
+    from quoridor.analyzer import engine
+    from quoridor.bots import MCTS4_OPTIONS, MCTS4_SEARCHER
+
+    assert engine.BOTS == ("v4", "v5", "mcts", "mcts4") and engine.DEFAULT_BOT == "v4"
+    m4, m3 = engine._new_mcts("mcts4"), engine._new_mcts()
+    assert m4.s.reserve_combo == MCTS4_SEARCHER["reserve_combo"] == m3.s.reserve_combo
+    assert m4.solver == MCTS4_OPTIONS["solver"] == 2
+    assert MCTS4_OPTIONS["scan"] > 0 and m3.scan == 0 < m4.scan
+    engine.reset_mcts_tree()
+    res = engine.analyze(["e2", "e8"], 0.3, bot="mcts4")
+    assert res["bot"] == "mcts4" and res["sims"] > 0 and 1 <= len(res["top"]) <= 3
+    assert set(engine._mcts_shared) == {"mcts4"}
+    engine.reset_mcts_tree()

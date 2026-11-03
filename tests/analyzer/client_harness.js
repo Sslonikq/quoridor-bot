@@ -129,7 +129,13 @@ const out = {};
   reset(); run('setBot("v5")'); await tick(); out.botSameCalls = calls.slice();   // the same bot: nothing happens
   run('setBot("bogus")'); run('setBot("constructor")'); out.botBogus = run("bot");
   run("hintOn = false; ana = null"); bodies.length = 0; run('setBot("v4")'); await tick(); out.botHintOff = bodies.length;
-  run("hintOn = true"); run('setBot("mcts")'); await tick();
+  run("hintOn = true"); run('setBot("mcts4")'); await tick();
+  out.bot4Bodies = bodies.filter(b => b[0] === "/api/analyze").slice(-1).map(b => b[1].bot);
+  out.bot4Stored = store.get("quoridor.analyzer.bot"); out.bot4Mark = run("ana && ana.botName");
+  run('live = {t0: Date.now(), sec: 10, depth: 7, sims: 1234}'); run("renderLive()");
+  out.bot4Msg = els.anaMsg.textContent; run("clearLive()");
+  store.set("quoridor.analyzer.bot", "mcts4"); out.loadedBot4 = run("loadBot()");
+  run('setBot("mcts")'); await tick();
   out.botBack = bodies.filter(b => b[0] === "/api/analyze").slice(-1).map(b => b[1].bot);
   store.set("quoridor.analyzer.bot", "v4"); out.loadedBotV4 = run("loadBot()");
   store.set("quoridor.analyzer.bot", "bogus"); out.loadedBotBogus = run("loadBot()");

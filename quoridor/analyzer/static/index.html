@@ -11,7 +11,7 @@
 <div class="wrap">
   <header>
     <h1>Анализатор Коридора</h1>
-    <span class="tag full-only">Подсказки бота (MCTS / v5 / v4), офлайн. Ходы за обе стороны вводите сами.</span>
+    <span class="tag full-only">Подсказки бота (MCTS / MCTS4 / v5 / v4), офлайн. Ходы за обе стороны вводите сами.</span>
     <span class="winctl">
       <button class="icon" id="bPin" title="Поверх всех окон" aria-pressed="false" hidden>📌</button>
       <button class="icon" id="bCompact" title="Компактный режим (C)" aria-pressed="false">◧<span class="lbl"> Компактно</span></button>
@@ -37,6 +37,7 @@
         </span>
         <span class="seg" role="group" aria-label="Бот подсказок">
           <button id="bot_mcts" title="MCTS (mcts3): поиск по дереву, решатель концовки, сильнее в борьбе стенок">MCTS</button>
+          <button id="bot_mcts4" title="MCTS4 (новый, фаза 14): MCTS со стенками вне кратчайших путей">MCTS4</button>
           <button id="bot_v5" title="v5: альфа-бета с угрозой комбинацией стенок">v5</button>
           <button id="bot_v4" title="v4: альфа-бета, прежний бот">v4</button>
         </span>

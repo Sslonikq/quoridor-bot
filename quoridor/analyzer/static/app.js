@@ -11,8 +11,9 @@ function loadMode() {
 }
 function saveMode(m) { try { localStorage.setItem(MODE_KEY, m); } catch (_) { /* не критично */ } }
 let mode = loadMode();
-// Бот подсказок: MCTS (по умолчанию) / v5 / v4. Имена для сервера (белый список) совпадают с ключами.
-const BOTS = { mcts: { name: "MCTS" }, v5: { name: "v5" }, v4: { name: "v4" } };
+// Бот подсказок: MCTS (по умолчанию) / MCTS4 / v5 / v4. Имена для сервера (белый список) совпадают с ключами.
+const BOTS = { mcts: { name: "MCTS", tree: true }, mcts4: { name: "MCTS4", tree: true }, v5: { name: "v5" }, v4: { name: "v4" } };
+const isTree = b => !!(BOTS[b] && BOTS[b].tree);  // боты с деревом (MCTS, MCTS4)
 const BOT_KEY = "quoridor.analyzer.bot";
 function loadBot() {
   try { const b = localStorage.getItem(BOT_KEY); if (b && Object.prototype.hasOwnProperty.call(BOTS, b)) return b; } catch (_) { /* хранилище недоступно */ }
@@ -206,7 +207,7 @@ function renderLive() {
   for (const k in MODES) { const b = $("mode_" + k); b.classList.toggle("on", k === mode); b.setAttribute("aria-pressed", k === mode ? "true" : "false"); }
   for (const k in BOTS) { const b = $("bot_" + k); b.classList.toggle("on", k === bot); b.setAttribute("aria-pressed", k === bot ? "true" : "false"); }
   if (live) {
-    const prog_ = bot === "mcts"
+    const prog_ = isTree(bot)
       ? `${live.depth ? `, главная линия ${live.depth}` : ""}${live.sims ? `, ${live.sims} симуляций` : ""}`
       : live.depth ? `, глубина ${live.depth}` : "";
     $("anaMsg").textContent = `${BOTS[bot].name}, ${MODES[mode].name}: ${liveElapsed().toFixed(0)} из ${live.sec} с${prog_}. Esc отменяет.`;
@@ -417,7 +418,7 @@ function renderBest() {
   if (!ana) { best.innerHTML = `<div class="hidden-hint">${anaState === "busy" ? "Считаю…" : anaState === "review" ? "Идёт разбор партии, подсказка появится для разобранных позиций." : ""}</div>`; msg.textContent = ""; return; }
   best.innerHTML = ana.top.map((x, i) => `<div class="bm${i ? "" : " top"}" data-i="${i}" tabindex="0" role="button"><span class="rk">${i + 1}</span><span class="mv">${x.name}</span><span class="why" title="${x.why} · ${x.visits ? `посещений ${x.visits}` : `глубина ${x.depth}`}">${x.why} · ${x.visits ? `${x.visits} пос.` : `гл. ${x.depth}`}</span><span class="ev">${x.exact || x.mate ? "" : "≤ "}${fmtE(x.score, x.mate)}</span></div>`).join("");
   best.querySelectorAll(".bm").forEach(d => { const go = () => play(ana.top[+d.dataset.i]); d.onclick = go; d.onkeydown = ev => { if (ev.key === "Enter") go(); }; });
-  const depthTxt = ana.bot === "mcts" ? `главная линия ${ana.depth}, ${ana.sims || 0} симуляций` : `глубина ${ana.depth}`;
+  const depthTxt = isTree(ana.bot) ? `главная линия ${ana.depth}, ${ana.sims || 0} симуляций` : `глубина ${ana.depth}`;
   const who = ana.review ? "Из разбора (v4): " : ana.mode ? `${BOTS[ana.botName] ? BOTS[ana.botName].name + ", " : ""}${MODES[ana.mode].name}, ${ana.secs} с: ` : "";
   msg.textContent = `${who}${depthTxt}, ${ana.elapsed.toFixed(1)} с. Оценка в шагах, плюс — белым; «≤» — оценка не лучше указанной.`;
 }

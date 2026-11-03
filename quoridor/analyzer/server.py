@@ -3,7 +3,7 @@
   POST /api/state    {"moves": [...]}              -> position, legal moves, winner
   POST /api/analyze  {"moves": [...], "time": 3.0, "bot": "mcts"} -> top-3 moves, evaluation,
                      depth ("time" is optional: engine.DEFAULT_TIME; "bot" is "v4" | "v5" |
-                     "mcts", default engine.DEFAULT_BOT; anything else is a 400)
+                     "mcts" | "mcts4", default engine.DEFAULT_BOT; anything else is a 400)
   POST /api/evaluate {"moves": [...], "move": "e3h", "time": 3.0}
                      -> score of that one move in the position after "moves" (engine.evaluate_move)
   POST /api/progress {}                            -> {"busy", "depth", "sims"}: live depth

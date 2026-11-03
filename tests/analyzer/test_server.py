@@ -511,12 +511,12 @@ def test_stale_job_does_not_overwrite_progress(server):
 # ---- the bot parameter of /api/analyze (phase 9, step 1) ----
 
 
-@pytest.mark.parametrize("bot", ["v4", "v5", "mcts"])
+@pytest.mark.parametrize("bot", ["v4", "v5", "mcts", "mcts4"])
 def test_analyze_runs_the_chosen_bot(server, bot):
     status, res = post(server, "/api/analyze", {"moves": ["e2", "e8"], "time": 0.5, "bot": bot})
     assert status == 200 and res["bot"] == bot and 1 <= len(res["top"]) <= 3
     assert res["eval"] == res["top"][0]["score"] and res["depth"] >= 1
-    if bot == "mcts":
+    if bot in ("mcts", "mcts4"):
         assert res["sims"] > 0 and all(t["visits"] > 0 for t in res["top"])
     else:
         assert "sims" not in res
@@ -532,9 +532,9 @@ def test_bot_is_passed_to_the_engine_and_defaults_to_v4(server, monkeypatch):
         return {"cancelled": True}
 
     monkeypatch.setattr(engine, "analyze", fake)
-    for body in ({}, {"bot": "mcts"}, {"bot": "v5"}):
+    for body in ({}, {"bot": "mcts"}, {"bot": "v5"}, {"bot": "mcts4"}):
         assert post(server, "/api/analyze", {"moves": [], "time": 1, **body})[0] == 200
-    assert seen == ["v4", "mcts", "v5"]
+    assert seen == ["v4", "mcts", "v5", "mcts4"]
 
 
 @pytest.mark.parametrize("bad", ["v3", "MCTS", "", "constructor", None, 4, True, ["mcts"]])
