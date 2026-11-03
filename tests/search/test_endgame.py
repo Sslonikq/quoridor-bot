@@ -255,9 +255,8 @@ def test_explicit_chunk_without_a_budget_stops(core):
     assert res.nodes <= eg.MAX_REPEATS * (res.depth + 1)
 
 
-def test_cancel_chunk_is_smaller():
-    """Review 0088 minor 4: with should_stop the jit calls are short (analyzer cancel)."""
-    assert eg.CANCEL_CHUNK["jit"] <= eg.CHUNK["jit"] // 4
+def _spy_calls(**kw) -> list[int]:
+    """Chunk (node limit) of every kernel call of a py-core solve."""
     calls = []
 
     class Spy(eg._PyCore):
@@ -267,8 +266,25 @@ def test_cancel_chunk_is_smaller():
 
     sol = EndgameSolver(tt_bits=10, core="py")
     sol._impl = Spy(10)
-    sol.solve(st((4, 1), (4, 7), WHITE, (1, 1)), should_stop=lambda: False, max_depth=6)
-    assert calls and max(calls) == eg.CANCEL_CHUNK["py"]
+    sol.solve(st((4, 1), (4, 7), WHITE, (1, 1)), max_depth=6, **kw)
+    return calls
+
+
+def test_cancel_chunk_is_smaller(monkeypatch):
+    """Review 0088 minor 4 / 0095 minor 1: with should_stop the calls take CANCEL_CHUNK
+    (analyzer cancel), with only a time_limit CHUNK. The py values are made different,
+    so taking the wrong table fails the test."""
+    assert eg.CANCEL_CHUNK["jit"] <= eg.CHUNK["jit"] // 4
+    monkeypatch.setitem(eg.CANCEL_CHUNK, "py", 300)
+    monkeypatch.setitem(eg.CHUNK, "py", 700)
+    calls = _spy_calls(should_stop=lambda: False)
+    assert calls and max(calls) == 300
+    calls = _spy_calls(time_limit=60.0)
+    assert calls and max(calls) == 700
+    calls = _spy_calls(should_stop=lambda: False, time_limit=60.0)
+    assert calls and max(calls) == 300  # should_stop wins over the plain clock
+    calls = _spy_calls(should_stop=lambda: False, chunk=123)
+    assert calls and max(calls) == 123  # an explicit chunk wins over both
 
 
 # ---------- known endgames (fixture) ----------
