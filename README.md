@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/icon_256.png" alt="Quoridor Analyzer" width="128"></p>
+
 # quoridor-bot
 
 Бот и анализатор для настольной игры **Quoridor** («Коридор»): доска 9×9, по 10 стенок у каждого игрока, цель — дойти до противоположного ряда.
