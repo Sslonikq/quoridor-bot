@@ -515,8 +515,9 @@ class EndgameSolver:
         nodes (default CANCEL_CHUNK with should_stop, else CHUNK of the core); a call cut
         by its chunk is repeated on the same depth (the TT keeps the finished subtrees),
         so the clock and should_stop() are checked every chunk. should_stop() true raises
-        SolverCancelled. Without time_limit and max_nodes a depth gets at most MAX_REPEATS
-        calls (the TT may not keep enough of the tree to finish it): then plies = 0.
+        SolverCancelled. Without time_limit, max_nodes and should_stop a depth gets at most
+        MAX_REPEATS calls (the TT may not keep enough of the tree to finish it): then
+        plies = 0. should_stop alone is a budget: the depth is repeated until cancelled.
         Without a clock and chunk: one call per depth, deterministic for max_nodes (the
         same in both cores; so is any fixed chunk)."""
         if winner(state) is not None:
@@ -535,7 +536,8 @@ class EndgameSolver:
                 chunk = CANCEL_CHUNK[self.core]
             elif deadline is not None:
                 chunk = CHUNK[self.core]
-        unbounded = deadline is None and max_nodes is None
+        # should_stop counts as a budget: the caller can cancel, so no MAX_REPEATS cap
+        unbounded = deadline is None and max_nodes is None and should_stop is None
         total = 0
         done = 0
         for r in range(1, max(1, min(max_depth, MAX_DEPTH)) + 1):

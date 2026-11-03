@@ -65,7 +65,16 @@ from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
 
 from quoridor import bitpaths
-from quoridor.bitpaths import GOAL_MASK, WALL_NOT_OF_CODE, Masks, add_wall, bit, build_masks, m8
+from quoridor.bitpaths import (
+    GOAL_MASK,
+    PAWN_TABLE,
+    WALL_NOT_OF_CODE,
+    Masks,
+    add_wall,
+    bit,
+    build_masks,
+    m8,
+)
 from quoridor.eval import (
     PLAN_V4,
     RACE_MIN_GAIN_V4,
@@ -301,16 +310,13 @@ _WALL_MOVES = tuple(WallMove(x, y, o) for x, y, o in bitpaths.WALL_OF_CODE)
 _PAWN_MOVES = tuple(PawnMove(i % 9, i // 9) for i in range(81))  # by bit index
 
 
-_PAWN_TABLE = bitpaths.PAWN_TABLE  # old name (the table lives in bitpaths, report 0093)
-
-
 def pawn_moves_m(m: Masks, cell: Cell, opp: Cell) -> list[PawnMove]:
     """rules.pawn_moves_for on the wall masks: the same moves in the same order (a mask
     bit is set exactly when the step is on the board and not blocked by a wall)."""
     u = cell[1] * 9 + cell[0]
     o = opp[1] * 9 + opp[0]
     out = []
-    for d, n, j, s1, t1, s2, t2 in _PAWN_TABLE[u]:
+    for d, n, j, s1, t1, s2, t2 in PAWN_TABLE[u]:
         if not m[d] >> u & 1:
             continue
         if n != o:
