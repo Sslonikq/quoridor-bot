@@ -88,3 +88,18 @@ input:focus-visible{outline:2px solid var(--hint);outline-offset:2px}
 button.busy{border-color:var(--hint);color:var(--hint)}
 #deepProg{margin-top:6px}
 .seg{display:inline-flex;gap:0}.seg button{border-radius:0;margin-left:-1px}.seg button:first-child{border-radius:6px 0 0 6px;margin-left:0}.seg button:last-child{border-radius:0 6px 6px 0}
+
+/* ---------- Окно: кнопки управления и компактный режим (~380 px) ---------- */
+.winctl{display:inline-flex;gap:6px;margin-left:auto}
+button.icon[hidden],#winNote[hidden]{display:none}
+#bPin[aria-pressed=true]{border-color:var(--hint);color:var(--hint)}
+#winNote{max-width:1120px;margin:8px auto 0;padding:0 16px}
+body.compact{padding-block:8px 12px;padding-left:8px;padding-right:8px;font-size:13px}
+body.compact .wrap{max-width:380px;gap:8px}
+body.compact .full-only,body.compact header h1,body.compact .lbl,body.compact kbd,body.compact #winNote{display:none}
+body.compact .main{grid-template-columns:minmax(0,1fr);gap:8px}
+body.compact .left,body.compact .side{gap:8px}
+body.compact .card{padding:8px;gap:6px}
+body.compact .toolbar{gap:4px}
+body.compact .bm{grid-template-columns:20px 54px 1fr auto;gap:6px;padding:5px 7px}
+body.compact header{gap:4px}

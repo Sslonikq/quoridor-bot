@@ -503,5 +503,58 @@ document.addEventListener("keydown", e => {
   else if (k === "Backspace") { $("bUndo").click(); e.preventDefault(); }
   else if (k === "f" || k === "F" || k === "а" || k === "А") $("bFlip").click();
   else if (k === "h" || k === "H" || k === "р" || k === "Р") $("bHint").click();
+  else if (k === "c" || k === "C" || k === "с" || k === "С") $("bCompact").click();
 });
 refresh();
+
+// ---------- Окно-приложение (фаза 12) ----------
+// В pywebview окно и настройки ведёт Python (js_api); в браузере режим только CSS + localStorage.
+const COMPACT_KEY = "quoridor.analyzer.compact";
+let native = null;        // window.pywebview.api, когда есть окно
+function applyCompact(on) {
+  document.body.classList.toggle("compact", on);
+  $("bCompact").setAttribute("aria-pressed", String(on));
+  $("bCompact").classList.toggle("on", on);
+  render();
+}
+function applyPin(on) { $("bPin").setAttribute("aria-pressed", String(on)); }
+async function setCompact(on) {
+  applyCompact(on);
+  if (native) { try { await native.set_compact(on); } catch (_) { /* окно закрывается */ } }
+  else { try { localStorage.setItem(COMPACT_KEY, on ? "1" : "0"); } catch (_) { /* не критично */ } }
+}
+$("bCompact").onclick = () => setCompact(!document.body.classList.contains("compact"));
+$("bPin").onclick = async () => {
+  if (!native) return;
+  const want = $("bPin").getAttribute("aria-pressed") !== "true";
+  try { applyPin(await native.set_on_top(want)); } catch (_) { toast("Не удалось переключить «поверх окон»"); }
+};
+// Причина браузерного режима приходит из __main__ в ?nowin=...
+const NOWIN_TEXT = {
+  missing: "Окно недоступно: pywebview не установлен (pip install -e .[app]). Открыто в браузере, «поверх всех окон» отключено.",
+  error: "Окно не открылось (см. консоль). Открыто в браузере, «поверх всех окон» отключено.",
+  browser: "Режим браузера (--browser): «поверх всех окон» отключено.",
+};
+async function initWindow() {
+  native = window.pywebview && window.pywebview.api && window.pywebview.api.get_settings ? window.pywebview.api : null;
+  if (native) {
+    try {
+      const s = await native.get_settings();
+      $("bPin").hidden = false; $("winNote").hidden = true; applyPin(!!s.on_top); applyCompact(!!s.compact);
+    } catch (_) { native = null; }
+  }
+  if (!native) {
+    const why = new URLSearchParams(location.search).get("nowin");
+    if (why !== null) { $("winNote").textContent = NOWIN_TEXT[Object.prototype.hasOwnProperty.call(NOWIN_TEXT, why) ? why : "missing"]; $("winNote").hidden = false; }
+    let on = false;
+    try { on = localStorage.getItem(COMPACT_KEY) === "1"; } catch (_) { /* хранилище недоступно */ }
+    applyCompact(on);
+  }
+}
+if (typeof window === "undefined" || !document.body) { /* тестовое окружение без DOM */ }
+else if (window.pywebview && window.pywebview.api) initWindow();
+else {
+  // pywebviewready может прийти и после таймера: тогда браузерный режим сменяется оконным (initWindow идемпотентна).
+  window.addEventListener("pywebviewready", () => initWindow());
+  setTimeout(() => { if (!native) initWindow(); }, 600); // браузер: события не будет
+}

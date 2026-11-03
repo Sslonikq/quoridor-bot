@@ -10,26 +10,30 @@
 <div class="wrap">
   <header>
     <h1>Анализатор Коридора</h1>
-    <span class="tag">Подсказки бота (MCTS / v5 / v4), офлайн. Ходы за обе стороны вводите сами.</span>
+    <span class="tag full-only">Подсказки бота (MCTS / v5 / v4), офлайн. Ходы за обе стороны вводите сами.</span>
+    <span class="winctl">
+      <button class="icon" id="bPin" title="Поверх всех окон" aria-pressed="false" hidden>📌</button>
+      <button class="icon" id="bCompact" title="Компактный режим (C)" aria-pressed="false">◧<span class="lbl"> Компактно</span></button>
+    </span>
   </header>
 
   <div class="main">
     <section class="left">
       <div class="toolbar">
-        <button class="icon" id="bFirst" title="К началу (Home)">«</button>
+        <button class="icon full-only" id="bFirst" title="К началу (Home)">«</button>
         <button class="icon" id="bPrev" title="Назад (←)">‹</button>
         <button class="icon" id="bNext" title="Вперёд (→)">›</button>
-        <button class="icon" id="bLast" title="К концу (End)">»</button>
-        <span class="sep"></span>
+        <button class="icon full-only" id="bLast" title="К концу (End)">»</button>
+        <span class="sep full-only"></span>
         <button id="bUndo" title="Отменить ход (Backspace)">↶<span class="lbl"> Отменить</span><kbd>⌫</kbd></button>
         <button id="bFlip" title="Перевернуть доску (F)">⇅<span class="lbl"> Перевернуть</span><kbd>F</kbd></button>
-        <button id="bHint" class="on" title="Подсказка (H)">💡<span class="lbl" id="hintLbl"> Подсказка: вкл</span><kbd>H</kbd></button>
-        <span class="seg" role="group" aria-label="Время подсказки">
+        <button class="full-only on" id="bHint" title="Подсказка (H)">💡<span class="lbl" id="hintLbl"> Подсказка: вкл</span><kbd>H</kbd></button>
+        <span class="seg full-only" role="group" aria-label="Время подсказки">
           <button id="mode_fast" title="Быстро: 2 с на позицию">Быстро<kbd>2 с</kbd></button>
           <button id="mode_normal" title="Нормально: 10 с на позицию">Нормально<kbd>10 с</kbd></button>
           <button id="mode_deep" title="Глубоко: 30 с на позицию (Esc отменяет)">Глубоко<kbd>30 с</kbd></button>
         </span>
-        <span class="seg" role="group" aria-label="Бот подсказок">
+        <span class="seg full-only" role="group" aria-label="Бот подсказок">
           <button id="bot_mcts" title="MCTS (mcts3): поиск по дереву, решатель концовки, сильнее в борьбе стенок">MCTS</button>
           <button id="bot_v5" title="v5: альфа-бета с угрозой комбинацией стенок">v5</button>
           <button id="bot_v4" title="v4: альфа-бета, прежний бот">v4</button>
@@ -39,11 +43,11 @@
         <div class="evalbar" id="evalbar" aria-label="Шкала оценки"><div class="w" id="evalW"></div><div class="num" id="evalNum"></div></div>
         <div class="boardbox"><svg id="board" viewBox="0 0 600 600" role="img" aria-label="Доска 9 на 9"></svg></div>
       </div>
-      <div class="card graph-card">
+      <div class="card graph-card full-only">
         <h2>График партии</h2>
         <svg class="graph" id="graph" viewBox="0 0 600 120" role="img" aria-label="Оценка по ходам"></svg>
       </div>
-      <div class="legend">
+      <div class="legend full-only">
         <span>Клик по клетке: ход фишкой.</span>
         <span>Наведите на щель между клетками: появится стенка, клик ставит её.</span>
         <span>Ход за обе стороны.</span>
@@ -61,14 +65,14 @@
         <progress id="deepProg" value="0" max="1" hidden></progress>
         <div class="msg" id="anaMsg"></div>
       </div>
-      <div class="card">
+      <div class="card full-only">
         <h2>Партия</h2>
         <div class="moves" id="moves"></div>
         <div class="mvinfo" id="mvInfo"></div>
         <div class="summary" id="summary"></div>
         <div class="toolbar"><button id="bRestore" hidden>Вернуть партию</button><button id="bCopy">Копировать ходы</button><button id="bNew">Новая доска</button></div>
       </div>
-      <div class="card load-card">
+      <div class="card load-card full-only">
         <h2>Загрузить и разобрать партию</h2>
         <textarea id="pgn" spellcheck="false" placeholder="Вставьте ходы с сайта: d1 e8 c1 e7 …"></textarea>
         <div class="toolbar">
@@ -82,6 +86,7 @@
     </aside>
   </div>
 </div>
+<div class="msg" id="winNote" hidden></div>
 <div class="toast" id="toast" role="status"></div>
 <script src="/app.js"></script>
 </body>
