@@ -103,3 +103,8 @@ body.compact .card{padding:8px;gap:6px}
 body.compact .toolbar{gap:4px}
 body.compact .bm{grid-template-columns:20px 54px 1fr auto;gap:6px;padding:5px 7px}
 body.compact header{gap:4px}
+
+/* компактный режим: время подсказки (2/10/30 с) и бот в одной строке */
+body.compact .seg kbd{display:inline;border:0;margin:0;padding:0;color:inherit}
+body.compact .seg button{padding:5px 8px}
+body.compact .toolbar{justify-content:space-between}

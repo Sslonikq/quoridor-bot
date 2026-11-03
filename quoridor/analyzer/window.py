@@ -10,6 +10,7 @@ Closing the window returns from run_native; the caller then closes the server it
 
 from __future__ import annotations
 
+import functools
 import importlib
 import sys
 import threading
@@ -47,6 +48,31 @@ def clamp_to_screens(settings: dict, screens: list[tuple[int, int, int, int]]) -
     return {**settings, "x": None, "y": None}
 
 
+def set_window_on_top(window: Any, value: bool) -> None:
+    """Set always-on-top from any thread.
+
+    pywebview 6.x (WinForms) sets Form.TopMost directly in the calling thread. From a js_api
+    thread that recreates the window handle across threads and deadlocks the UI ("Not
+    responding"). So on WinForms the assignment is marshalled to the UI thread with
+    Control.Invoke; elsewhere (or if that is not possible) the plain property is used.
+    """
+    try:
+        from System import Func, Type  # type: ignore[import-not-found]
+        from webview.platforms.winforms import BrowserView  # type: ignore[import-not-found]
+
+        form = BrowserView.instances.get(window.uid)
+    except Exception:  # not WinForms (other OS / backend) or an API change
+        form = None
+    if form is None:
+        window.on_top = value
+        return
+
+    def apply() -> None:
+        form.TopMost = value
+
+    form.Invoke(Func[Type](apply))
+
+
 class WindowApi:
     """Exposed to the page as window.pywebview.api (js_api)."""
 
@@ -69,7 +95,7 @@ class WindowApi:
         value = bool(value)
         self._store.update(on_top=value)
         if self._window is not None:
-            self._window.on_top = value
+            set_window_on_top(self._window, value)
         self.save_soon()
         return value
 
@@ -99,8 +125,8 @@ class WindowApi:
             self._abnormal.add(name)
 
     def on_moved(self, x: int, y: int) -> None:
-        if self._abnormal:
-            return
+        if self._abnormal or x <= -30000 or y <= -30000:
+            return  # minimized (Windows reports -32000) or an implausible position
         self._store.update(x=x, y=y)
         self.save_soon()
 
@@ -162,7 +188,7 @@ def run_native(
     for name in ("minimized", "maximized", "restored"):
         event = getattr(window.events, name, None)
         if event is not None:
-            event += lambda name=name: api.on_state(name)
+            event += functools.partial(api.on_state, name)
     try:
         webview_module.start()
     finally:
