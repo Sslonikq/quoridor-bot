@@ -587,6 +587,59 @@ def make_mcts3_match(seed: int) -> MCTSBot:
     return _mcts3(seed, move_time=MATCH_MOVE_TIME)
 
 
+# MCTS4 (phase 14, report 0126): mcts3 + walls off the shortest paths in the tree and a visit
+# floor. quoridor.threat.wall_scan ranks every wall by what it does to both players' wall
+# combinations (the first wall of a cage, a wall taking a square the opponent's cage needs:
+# game09 6... a7h, game08 8... d9v, game11 9. h8v); the best `scan` attack and defence walls
+# join the root and, once a node of depth 1..widen has widen_visits visits, that node too;
+# every wall of such a node gets scan_logit per step of its term (at most 4) in its prior.
+# Defence walls count from a term of scan_min = 3 steps (2-step defences against a lone
+# wall were mirages: g03-m16). A root wall child gets at least floor_prior * its prior of
+# the root's visits, so a wall whose win only shows after a few thousand visits (game10
+# 12. b8h, game11 9. h8v) is not dropped after its first ones. Floors below the root
+# (floor_depth 1-2) made the root side optimistic (forced visits to the opponent's weak
+# walls: g07-m25/m27 above 0) and were dropped. Report 0126: live positions 5/8 at 400k and
+# 2M simulations (mcts3 2/8), sanity matches against mcts3 in the report.
+MCTS4_SEARCHER: dict[str, int] = dict(MCTS3_SEARCHER)
+MCTS4_OPTIONS: dict[str, float] = {
+    **MCTS3_OPTIONS,
+    "scan": 3,
+    "scan_k": 3,
+    "scan_logit": 1.0,
+    "scan_min": 3,
+    "widen": 1,
+    "widen_visits": 2000,
+    "floor": 0.0,
+    "floor_prior": 0.3,
+    "floor_depth": 0,
+    "floor_walls": 1,
+}
+
+
+def _mcts4(seed: int, **limit: float) -> MCTSBot:
+    return MCTSBot(seed, searcher_settings=MCTS4_SEARCHER, **limit, **MCTS4_OPTIONS)  # type: ignore[arg-type]
+
+
+def make_mcts4(seed: int) -> MCTSBot:
+    """MCTS4 with MCTS_SIMS simulations per move (deterministic per seed)."""
+    return _mcts4(seed, sims=MCTS_SIMS)
+
+
+def make_mcts4_clock(seed: int) -> MCTSBot:
+    """MCTS4 on a 10-minute game clock."""
+    return _mcts4(seed, game_time=GAME_TIME)
+
+
+def make_mcts4_fast(seed: int) -> MCTSBot:
+    """MCTS4 with FAST_MOVE_TIME per move."""
+    return _mcts4(seed, move_time=FAST_MOVE_TIME)
+
+
+def make_mcts4_match(seed: int) -> MCTSBot:
+    """MCTS4 with MATCH_MOVE_TIME per move."""
+    return _mcts4(seed, move_time=MATCH_MOVE_TIME)
+
+
 def make_v4_frozen(seed: int) -> SearchBot:
     """v4 exactly as in reports 0061/0062 (quoridor/frozen/search_v4.py), depth V4_DEPTH.
 
@@ -655,6 +708,10 @@ BOTS: dict[str, BotFactory] = {
     "mcts3-clock": make_mcts3_clock,
     "mcts3-0.2s": make_mcts3_fast,
     "mcts3-3s": make_mcts3_match,
+    "mcts4": make_mcts4,
+    "mcts4-clock": make_mcts4_clock,
+    "mcts4-0.2s": make_mcts4_fast,
+    "mcts4-3s": make_mcts4_match,
 }
 # Bots whose play does not depend on the seed in a meaningful way (seed only breaks ties):
 # a mirror match of such a bot repeats the same game.

@@ -24,6 +24,7 @@ as py_combo_threat; tests/paths/test_jit.py compares them).
 from __future__ import annotations
 
 from collections.abc import Set as AbstractSet
+from dataclasses import dataclass
 
 from quoridor import bitpaths
 from quoridor.bitpaths import GOAL_MASK, Masks, N, bit
@@ -180,6 +181,99 @@ def combo_threat(
             best_d.append(top[0])
             best_w.append(top[2])
     return d0, tuple(best_d), tuple(best_w)
+
+
+def _level(d0: int, ds: tuple[int, ...], j: int) -> int:
+    """B's distance after the best set of at most j walls (j = 0: now)."""
+    if j <= 0 or not ds:
+        return d0
+    return ds[min(j, len(ds)) - 1]
+
+
+@dataclass(frozen=True)
+class ScanResult:
+    """wall_scan: the walls of the side to move ranked by what they do to the combinations."""
+
+    attack: tuple[tuple[tuple[int, int], Wall], ...]  # ((max, sum) of att_j, wall), best first
+    defend: tuple[tuple[tuple[int, int], Wall], ...]  # ((max, sum) of def_j, wall), best first
+
+
+def wall_scan(
+    m: Masks,
+    h: AbstractSet[tuple[int, int]],
+    v: AbstractSet[tuple[int, int]],
+    me_cell: Cell,
+    op_cell: Cell,
+    me: int,
+    walls: tuple[int, int],
+    k: int,
+    beam: int = 4,
+    narrow: int = 0,
+) -> ScanResult:
+    """Every wall of the side to move `me` (walls[me] > 0) that fits and leaves both paths,
+    ranked by the combinations it changes (mcts4, phase 14; reports 0123 / 0124).
+
+    combo_threat only extends wall sets on B's current shortest-path DAG, so it never offers
+    a first wall off that DAG: a wall that prepares a cage (game09 6... a7h) or that takes a
+    square the opponent's cage needs (game08 8... d9v, game11 9. h8v). Here each wall w is
+    placed and the beam is run again from the new position, for both players:
+      att_j = op's distance after w and its best j - 1 more walls of ours
+              - op's distance after our best j walls without w   (j = 1..min(walls[me], k));
+      def_j = our distance after the opponent's best j walls without w
+              - the same after w                                 (j = 1..min(walls[op], k)).
+    att_j = 0: w is as good a first wall of a j-wall combination as the beam's best;
+    def_j > 0: w takes away part of the opponent's j-wall combination against us.
+    `attack` keeps the walls with max att_j >= 0, `defend` those with max def_j >= 1, both
+    without walls that lengthen our path more than the opponent's (as Searcher._combo_walls),
+    by (max, sum) of the terms, then by wall. Estimates like combo_threat (pawns stand still),
+    pure; the beam settings are the searcher's (combo_beam / combo_narrow).
+    """
+    op = 1 - me
+    ja = min(walls[me], k)
+    jd = min(walls[op], k)
+    if ja <= 0:
+        return ScanResult((), ())
+    start_me, goal_me = bit(me_cell), GOAL_MASK[me]
+    start_op, goal_op = bit(op_cell), GOAL_MASK[op]
+    a0, ads, _ = combo_threat(m, h, v, op_cell, op, k, beam, narrow)
+    if jd:
+        t0, tds, _ = combo_threat(m, h, v, me_cell, me, k, beam, narrow)
+    distance = bitpaths.distance
+    d_me0 = distance(m, start_me, goal_me)
+    assert d_me0 is not None
+    attack: list[tuple[tuple[int, int], Wall]] = []
+    defend: list[tuple[tuple[int, int], Wall]] = []
+    m0, m1, m2, m3 = m
+    for x in range(WALL_GRID):
+        for y in range(WALL_GRID):
+            for o in (H, V):
+                w = (x, y, o)
+                if not fits(h, v, w):
+                    continue
+                n0, n1, n2, n3 = bitpaths.wall_bits(x, y, o)
+                cm = (m0 & ~n0, m1 & ~n1, m2 & ~n2, m3 & ~n3)
+                d_op = distance(cm, start_op, goal_op)
+                d_me = distance(cm, start_me, goal_me)
+                if d_op is None or d_me is None:
+                    continue  # cuts someone off: illegal
+                if d_me - d_me0 > d_op - a0:
+                    continue  # hurts us more than the opponent
+                if o == H:
+                    ch, cv = h | {(x, y)}, v
+                else:
+                    ch, cv = h, v | {(x, y)}
+                b0, bds, _ = combo_threat(cm, ch, cv, op_cell, op, k, beam, narrow)
+                att = [_level(b0, bds, j - 1) - _level(a0, ads, j) for j in range(1, ja + 1)]
+                if max(att) >= 0:
+                    attack.append(((max(att), sum(att)), w))
+                if jd:
+                    u0, uds, _ = combo_threat(cm, ch, cv, me_cell, me, k, beam, narrow)
+                    de = [_level(t0, tds, j) - _level(u0, uds, j) for j in range(1, jd + 1)]
+                    if max(de) >= 1:
+                        defend.append(((max(de), sum(de)), w))
+    attack.sort(key=lambda t: (-t[0][0], -t[0][1], t[1]))
+    defend.sort(key=lambda t: (-t[0][0], -t[0][1], t[1]))
+    return ScanResult(tuple(attack), tuple(defend))
 
 
 # ---------- numba (phase 9, step 6) ----------

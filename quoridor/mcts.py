@@ -35,6 +35,15 @@
   the last root.
 * rep_penalty (value units): root moves back to an own (cell, walls left) of the last
   REP_WINDOW own positions of the game (set_history) lose that much Q per occurrence.
+* mcts4 (phase 14, report 0126; off by default): scan > 0 adds the best attack / defence
+  walls of quoridor.threat.wall_scan (walls off the shortest paths that start or break a
+  wall combination) to the root and, with widen = D, to every node of depth 1..D once it
+  has widen_visits visits (the node's list is rebuilt, its children kept; the jit kernel
+  stops with ST_WIDEN and Python widens the node, so both cores widen at the same point).
+  Every wall of such a node gets scan_logit per step of its scan term in its logit. A visit
+  floor (floor + floor_prior * prior of the node's visits, at depth <= floor_depth, walls
+  only with floor_walls) picks an under-visited child before PUCT. On reuse the widened
+  flags are dropped (the jit compaction does not keep them): nodes are widened again.
 
 Two cores with the same results (tests/search/test_mcts.py compares whole trees):
 * "jit" (quoridor.jit.ENABLED, report 0082): the tree is numpy arrays and every
@@ -56,7 +65,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from quoridor import jit as _jit
-from quoridor.bitpaths import m8
+from quoridor.bitpaths import add_wall, m8
 from quoridor.endgame import EndgameSolver, SolverCancelled, SolveResult
 from quoridor.eval import WIN
 from quoridor.rules import apply_move_unchecked, pawn_moves, winner
@@ -68,6 +77,7 @@ from quoridor.search import (
     opponent_winning_moves,
 )
 from quoridor.state import GameState, H, Move, PawnMove, WallMove, goal_row
+from quoridor.threat import ScanResult, wall_scan
 from quoridor.timeman import move_budget
 
 _K = _jit.kernels()  # quoridor.kernels or None (pure Python)
@@ -96,11 +106,32 @@ MCTS_DEFAULTS: dict[str, float] = {
     "solver": -1,
     "solver_share": 0.5,
     "solver_nodes": 200,
+    # mcts4 (phase 14, report 0126), all off by default:
+    # scan > 0: the root and the widened nodes also get the `scan` best attack and the
+    # `scan` best defence walls of quoridor.threat.wall_scan (combinations over scan_k
+    # levels) that are not in the move set yet, logit base + special + gain * net gain +
+    # scan_logit * (the wall's best combination term, capped at 4)
+    "scan": 0,
+    "scan_k": 3,
+    "scan_logit": 0.0,
+    "scan_min": 1,  # a defence wall counts (extra, bonus) only with a term of at least this
+    # widen = D > 0: a node at depth 1..D gets those walls once it has widen_visits visits
+    # (its move list is rebuilt with them, the children and their statistics are kept)
+    "widen": 0,
+    "widen_visits": 1000,
+    # floor > 0: at a node of depth <= floor_depth a child (a wall only, if floor_walls)
+    # with fewer than floor * (the node's visits) visits is chosen before PUCT (the first
+    # such child in the move order); a child proven won for the opponent is not
+    "floor": 0.0,
+    "floor_prior": 0.0,  # the floor of a child also grows by floor_prior * its prior
+    "floor_depth": 0,
+    "floor_walls": 1,
 }
 CORES = ("jit", "py")
 
 PROVEN_SCORE = WIN - 2  # reported score of a proven win (loss: the negative)
 _PROVEN_SCORE = PROVEN_SCORE  # old name
+SCAN_TERM_CAP = 4  # mcts4: steps of a wall_scan term counted in the prior (scan_logit)
 PROGRESS_EVERY = 0.2  # seconds between on_progress calls (default)
 
 # jit core: tree arrays (grown by doubling when full, up to the caps; then the search
@@ -181,7 +212,7 @@ class MCTSCancelled(Exception):
 
 
 class _Node:
-    __slots__ = ("state", "moves", "states", "priors", "kids", "n", "w", "proven")
+    __slots__ = ("state", "moves", "states", "priors", "kids", "n", "w", "proven", "wide")
 
     def __init__(self, state: GameState) -> None:
         self.state = state
@@ -192,6 +223,7 @@ class _Node:
         self.n = 0
         self.w = 0.0  # sum of values for the side to move at this node
         self.proven = 0  # +1 won / -1 lost for the side to move, 0 unknown
+        self.wide = False  # mcts4: the scan walls were added (widen)
 
 
 class _Tree:
@@ -203,6 +235,7 @@ class _Tree:
         self.npv = np.zeros(nodes, dtype=np.int8)  # proven
         self.ne0 = np.full(nodes, -1, dtype=np.int32)  # first edge, -1: not expanded
         self.nne = np.zeros(nodes, dtype=np.int16)  # number of edges
+        self.nwd = np.zeros(nodes, dtype=np.int8)  # mcts4: widened (not kept on reuse)
         self.emv = np.zeros(edges, dtype=np.int16)  # move code
         self.epr = np.zeros(edges, dtype=np.float64)  # prior
         self.ekid = np.full(edges, -1, dtype=np.int32)  # child node, -1: none yet
@@ -219,6 +252,7 @@ class _Tree:
         self.npv[i] = 0
         self.ne0[i] = -1
         self.nne[i] = 0
+        self.nwd[i] = 0
         return i
 
     def grow(self) -> bool:
@@ -229,7 +263,14 @@ class _Tree:
         if (need_n and nodes >= MAX_NODES) or (need_e and edges >= MAX_EDGES):
             return False
         if need_n:
-            for name, fill in (("nn", 0), ("nw", 0.0), ("npv", 0), ("ne0", -1), ("nne", 0)):
+            for name, fill in (
+                ("nn", 0),
+                ("nw", 0.0),
+                ("npv", 0),
+                ("ne0", -1),
+                ("nne", 0),
+                ("nwd", 0),
+            ):
                 old = getattr(self, name)
                 new = np.full(min(nodes * 2, MAX_NODES), fill, dtype=old.dtype)
                 new[:nodes] = old
@@ -288,6 +329,16 @@ class MCTS:
         self.solver = int(o["solver"])
         self.solver_share = float(o["solver_share"])
         self.solver_nodes = int(o["solver_nodes"])
+        self.scan = int(o["scan"])
+        self.scan_k = max(1, int(o["scan_k"]))
+        self.k_scan = float(o["scan_logit"])
+        self.scan_min = max(1, int(o["scan_min"]))
+        self.widen = int(o["widen"]) if self.scan else 0  # nothing to add without scan
+        self.widen_visits = max(2, int(o["widen_visits"]))
+        self.floor = float(o["floor"])
+        self.floor_prior = float(o["floor_prior"])
+        self.floor_depth = int(o["floor_depth"])
+        self.floor_walls = int(o["floor_walls"])
         self._solver: EndgameSolver | None = None  # created on first use (its TT is kept)
         self.last_solve: SolveResult | None = None  # the solver's result of the last search
         if self.expand_visits not in (1, 2):
@@ -340,10 +391,11 @@ class MCTS:
         return z ^ (z >> 31)
 
     def _expand_lists(
-        self, state: GameState, pawns: list[PawnMove], root: bool
+        self, state: GameState, pawns: list[PawnMove], root: bool, wide: bool = False
     ) -> tuple[list[Move], list[GameState], list[float]]:
         """(moves, child states, priors) of a node (not terminal, no winning pawn move),
-        best prior first."""
+        best prior first. With scan > 0 the root and a widened node (wide) also get the
+        wall_scan walls."""
         s = self.s
         me = state.turn
         m = s.masks(state)
@@ -365,11 +417,22 @@ class MCTS:
         if saving:
             base += self.k_saving
         seen: set[Move] = set(moves)
+        scan = None
+        bonus: dict[Move, float] = {}
+        if self.scan and (root or wide) and not saving and state.walls_left[me] > 0:
+            scan = self._scan(state, m)
+            k_scan = self.k_scan
+            for ranked in (scan.attack, scan.defend):  # a wall in both: the larger term
+                for key, (x, y, o) in ranked:
+                    w = WallMove(x, y, o)
+                    b = k_scan * min(key[0], SCAN_TERM_CAP)
+                    if b > bonus.get(w, -1.0):
+                        bonus[w] = b
         for gain, w, child in s.candidate_walls(state):
             seen.add(w)
             moves.append(w)
             states.append(child)
-            logits.append(base + self.k_gain * gain)
+            logits.append(base + self.k_gain * gain + bonus.get(w, 0.0))
         extras: list[tuple[Move, GameState]] = []
         if root:
             extras = [(mv, c) for mv, c in s._root_moves(state, pawns) if mv not in seen]
@@ -387,7 +450,12 @@ class MCTS:
             gain = (op_after - d_op) - (me_after - d_me)
             moves.append(mv)
             states.append(c)
-            logits.append(base + self.k_special + self.k_gain * gain)
+            logits.append(base + self.k_special + self.k_gain * gain + bonus.get(mv, 0.0))
+        if scan is not None:
+            for mv, c, gain in self._scan_walls(state, scan, seen, m, d_me, d_op):
+                moves.append(mv)
+                states.append(c)
+                logits.append(base + self.k_special + self.k_gain * gain + bonus[mv])
         # seeded order of equal children (ties in selection keep the list order)
         order = list(range(len(moves)))
         for i in range(len(order) - 1, 0, -1):
@@ -402,6 +470,56 @@ class MCTS:
         for e in ex:  # plain left-to-right sum, as the kernel (not math.fsum / sum())
             tot += e
         return [moves[i] for i in order], [states[i] for i in order], [e / tot for e in ex]
+
+    def _scan(self, state: GameState, m) -> ScanResult:
+        """threat.wall_scan of the side to move (scan_k levels, the searcher's beam), the
+        defence walls with a term below scan_min dropped."""
+        s = self.s
+        me = state.turn
+        res = wall_scan(
+            m,
+            state.h_walls,
+            state.v_walls,
+            state.pawns[me],
+            state.pawns[1 - me],
+            me,
+            state.walls_left,
+            self.scan_k,
+            s.combo_beam,
+            s.combo_narrow,
+        )
+        if self.scan_min > 1:
+            lo = self.scan_min
+            res = ScanResult(res.attack, tuple(t for t in res.defend if t[0][0] >= lo))
+        return res
+
+    def _scan_walls(
+        self, state: GameState, res: ScanResult, seen: set[Move], m, d_me: int, d_op: int
+    ) -> list[tuple[WallMove, GameState, int]]:
+        """(wall, child, net gain) of the `scan` best attack walls and the `scan` best
+        defence walls of `res` that are not in `seen` (added to it), attack first."""
+        s = self.s
+        me = state.turn
+        my_cell, op_cell = state.pawns[me], state.pawns[1 - me]
+        out: list[tuple[WallMove, GameState, int]] = []
+        for ranked in (res.attack, res.defend):
+            taken = 0
+            for _, (x, y, o) in ranked:
+                if taken >= self.scan:
+                    break
+                w = WallMove(x, y, o)
+                if w in seen:
+                    continue
+                seen.add(w)
+                taken += 1
+                cm = add_wall(m, x, y, o)
+                child = apply_move_unchecked(state, w)
+                s._store_masks((child.h_walls, child.v_walls), cm)
+                me_after = s.dist_m(cm, my_cell, me)
+                op_after = s.dist_m(cm, op_cell, 1 - me)
+                assert me_after is not None and op_after is not None
+                out.append((w, child, (op_after - d_op) - (me_after - d_me)))
+        return out
 
     def _expand(self, node: _Node, pawns: list[PawnMove], root: bool) -> None:
         node.moves, node.states, node.priors = self._expand_lists(node.state, pawns, root)
@@ -458,7 +576,21 @@ class MCTS:
                         return gk
         return _Node(state)
 
-    def _select(self, node: _Node, pen: list[float] | None) -> int:
+    def _select(
+        self, node: _Node, pen: list[float] | None, thr: float = 0.0, thr_p: float = 0.0
+    ) -> int:
+        if thr > 0.0 or thr_p > 0.0:  # mcts4 floor: the first child below its floor
+            walls_only = self.floor_walls
+            for i, k in enumerate(node.kids):
+                if walls_only and not isinstance(node.moves[i], WallMove):  # type: ignore[index]
+                    continue
+                lim = thr + thr_p * node.priors[i]
+                if lim <= 0.0:
+                    continue
+                if k is None:
+                    return i
+                if k.proven != 1 and k.n < lim:
+                    return i
         sq = self.c_puct * math.sqrt(node.n)
         fpu = node.w / node.n - self.fpu if node.n else 0.0
         best_i = -1
@@ -503,7 +635,19 @@ class MCTS:
                     break  # a new leaf
                 # expand_visits = 2: the second visit expands the leaf, then descends
                 self._expand(node, pawn_moves(node.state), False)
-            i = self._select(node, pen if node is root else None)
+            depth = len(path) - 1
+            if (
+                self.widen
+                and 1 <= depth <= self.widen
+                and not node.wide
+                and node.n >= self.widen_visits
+            ):
+                self._widen(node)
+            thr = thr_p = 0.0
+            if depth <= self.floor_depth:
+                thr = self.floor * node.n
+                thr_p = self.floor_prior * node.n
+            i = self._select(node, pen if node is root else None, thr, thr_p)
             if i < 0:  # every child loses: proven lost
                 node.proven = -1
                 break
@@ -546,6 +690,17 @@ class MCTS:
                     nd.proven = -1
             child_proven = nd.proven
 
+    def _widen(self, node: _Node) -> None:
+        """mcts4: rebuild the move list of an inner node with the scan walls, keeping the
+        existing children (and their statistics)."""
+        node.wide = True
+        old = {mv: k for mv, k in zip(node.moves, node.kids, strict=True)}  # type: ignore[arg-type]
+        moves, states, priors = self._expand_lists(
+            node.state, pawn_moves(node.state), False, wide=True
+        )
+        node.moves, node.states, node.priors = moves, states, priors
+        node.kids = [old.get(mv) for mv in moves]
+
     def _add_root_extras(self, root: _Node, pawns: list[PawnMove]) -> None:
         """A reused root lacks the root-only walls: rebuild its move list with them,
         keeping the existing children (and their statistics)."""
@@ -566,6 +721,12 @@ class MCTS:
         else:
             # the reused root was expanded as an inner node: add the root extras
             self._add_root_extras(root, pawns)
+            if self.widen:  # as the jit core, whose compacted tree forgets the flags
+                stack = [root]
+                while stack:
+                    nd = stack.pop()
+                    nd.wide = False
+                    stack.extend(k for k in nd.kids if k is not None)
         self._root = root
         pen = self._pen = self._penalties(root)
         done = 0
@@ -672,6 +833,24 @@ class MCTS:
         self._jstate = state
         self._jkid_states = states
 
+    def _jit_widen(self, root_state: GameState, wbuf) -> None:
+        """mcts4: the node at the end of the path in wbuf gets the scan walls (as _widen)."""
+        t = self._tree
+        assert t is not None
+        st = root_state
+        node = 0
+        for j in range(1, int(wbuf[0])):
+            e = int(wbuf[j])
+            st = apply_move_unchecked(st, _CODE_MOVES[t.emv[e]])  # type: ignore[arg-type]
+            node = int(t.ekid[e])
+        t.nwd[node] = 1
+        old = {int(t.emv[e]): int(t.ekid[e]) for e in t.edges_of(node)}
+        moves, _, priors = self._expand_lists(st, pawn_moves(st), False, wide=True)
+        try:
+            self._jit_write_edges(node, moves, priors, old)
+        except MemoryError:
+            pass  # arrays at their caps: the node keeps its moves
+
     def _jit_write_edges(
         self, node: int, moves: list[Move], priors: list[float], kids: dict[int, int] | None
     ) -> None:
@@ -712,6 +891,10 @@ class MCTS:
         ip[_K.IP_RESERVE_K] = s.reserve_k
         ip[_K.IP_COMBO_LEVELS] = s.combo_levels
         ip[_K.IP_RESERVE_MIN] = s.reserve_min
+        ip[_K.IP_WIDEN] = self.widen
+        ip[_K.IP_WIDEN_VISITS] = self.widen_visits
+        ip[_K.IP_FLOOR_DEPTH] = self.floor_depth
+        ip[_K.IP_FLOOR_WALLS] = self.floor_walls
         fp = np.zeros(_K.FP_SIZE, dtype=np.float64)
         fp[_K.FP_C_PUCT] = self.c_puct
         fp[_K.FP_SCALE] = self.scale
@@ -722,6 +905,8 @@ class MCTS:
         fp[_K.FP_BEHIND] = self.k_behind
         fp[_K.FP_SAVING] = self.k_saving
         fp[_K.FP_TEMPO] = TEMPO
+        fp[_K.FP_FLOOR] = self.floor
+        fp[_K.FP_FLOOR_PRIOR] = self.floor_prior
         return ip, fp
 
     def _run_jit(self, state, pawns, sims, deadline, should_stop, on_progress, every) -> int:
@@ -751,6 +936,7 @@ class MCTS:
                 np.zeros((size, 3), dtype=np.int64),
             )
         ck, cv = self._memo
+        wbuf = np.zeros(_K.MAX_PATH, dtype=np.int64)
         done = 0
         batch = 16
         last = time.perf_counter()
@@ -772,12 +958,16 @@ class MCTS:
             ran, status = _K.mcts_run(
                 t.nn, t.nw, t.npv, t.ne0, t.nne, t.emv, t.epr, t.ekid, t.ctr, t.rng,
                 0, rm, rhb, rvb, rpawn, rwl, state.turn, fp, ip, pen, use_pen, ct, ck, cv, k, done,
+                t.nwd, wbuf,
             )  # fmt: skip
             self._rs = int(t.rng[0])
             done += ran
             if status == _K.ST_FULL:
                 if not t.grow():
                     break  # at the caps: play with what we have
+                continue
+            if status == _K.ST_WIDEN:
+                self._jit_widen(state, wbuf)
                 continue
             if status != _K.ST_DONE:
                 break

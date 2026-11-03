@@ -795,7 +795,11 @@ IP_RESERVE_COMBO = 14  # Searcher.reserve_combo (report 0085)
 IP_RESERVE_K = 15  # Searcher.reserve_k
 IP_COMBO_LEVELS = 16  # Searcher.combo_levels: levels of the combination memo ct
 IP_RESERVE_MIN = 17  # Searcher.reserve_min
-IP_SIZE = 18
+IP_WIDEN = 18  # mcts4: nodes of depth 1..this get the scan walls (0: off)
+IP_WIDEN_VISITS = 19  # ... once they have this many visits
+IP_FLOOR_DEPTH = 20  # mcts4: the visit floor at nodes of depth <= this
+IP_FLOOR_WALLS = 21  # 1: the floor only for walls
+IP_SIZE = 22
 
 FP_C_PUCT = 0
 FP_SCALE = 1
@@ -806,7 +810,9 @@ FP_GAIN = 5
 FP_BEHIND = 6
 FP_SAVING = 7
 FP_TEMPO = 8
-FP_SIZE = 9
+FP_FLOOR = 9  # mcts4: visit floor (share of the node's visits), 0: off
+FP_FLOOR_PRIOR = 10  # mcts4: + this * the child's prior (share of the node's visits)
+FP_SIZE = 11
 
 WALL_MOVE = 128  # move code of wall w: WALL_MOVE + w
 _STEP = 100  # eval.STEP
@@ -818,6 +824,7 @@ ST_DONE = 0  # the requested simulations ran
 ST_FULL = 1  # the tree arrays are full: grow them and call again
 ST_PROVEN = 2  # the root is proven
 ST_ONE = 3  # one root move and >= 2 simulations: nothing to choose
+ST_WIDEN = 4  # mcts4: a node to widen (wbuf = [path length, edges of the path...])
 
 _GOLDEN = _U(0x9E3779B97F4A7C15)
 _MIX1 = _U(0xBF58476D1CE4E5B9)
@@ -1380,10 +1387,26 @@ def _finish(node, cnt, mv, lg, order, ex, rng, ne0, nne, emv, epr, ekid, ctr):
 
 
 @njit(cache=True)
-def _select(node, nn, nw, npv, ne0, nne, epr, ekid, c_puct, fpu_c, pen, use_pen):
+def _select(node, nn, nw, npv, ne0, nne, emv, epr, ekid, c_puct, fpu_c, pen, use_pen, thr,
+            thr_p, fwalls):  # fmt: skip
     """mcts.MCTS._select: PUCT with FPU; children proven won for the opponent are
-    skipped; -1 if every child is."""
+    skipped; -1 if every child is. thr + thr_p > 0 (mcts4 floor): first the first child
+    (a wall only, if fwalls) with fewer than thr + thr_p * prior visits."""
     n = nn[node]
+    if thr > 0.0 or thr_p > 0.0:
+        e0 = ne0[node]
+        for i in range(nne[node]):
+            e = e0 + i
+            if fwalls and emv[e] < WALL_MOVE:
+                continue
+            lim = thr + thr_p * epr[e]
+            if lim <= 0.0:
+                continue
+            k = ekid[e]
+            if k < 0:
+                return i
+            if npv[k] != 1 and nn[k] < lim:
+                return i
     sq = c_puct * math.sqrt(n)
     fpu = nw[node] / n - fpu_c if n else 0.0
     best_i = -1
@@ -1443,12 +1466,15 @@ def _expand(node, m, hb, vb, cme, cop, wm, me, d_me, d_op, k, pawns, fp, ip, mv,
 def mcts_run(
     nn, nw, npv, ne0, nne, emv, epr, ekid, ctr, rng,
     root, rm, rhb, rvb, rpawn, rwl, rturn, fp, ip, pen, use_pen, ct, ck, cv, nsims, done0,
+    nwd, wbuf,
 ):  # fmt: skip
     """Up to nsims simulations of mcts.MCTS._simulate from node `root` (position: masks rm,
     wall sets rhb / rvb, pawns rpawn, walls left rwl, side to move rturn). ctr = [nodes,
     edges, deepest path]; rng = [splitmix state]; pen = root penalties (use_pen); ct = the
     combination memo of the root walls; ck / cv = the
     _race_best / _wall_race memo (kept between searches); done0 = simulations of this search so far.
+    nwd = widened flags per node, wbuf = the path of a node to widen (mcts4: ST_WIDEN stops
+    before that simulation changed anything; the caller widens and calls again).
     Returns (simulations run, ST_*)."""
     pawns = np.empty(8, dtype=np.int64)
     tmp = np.empty(8, dtype=np.int64)
@@ -1466,11 +1492,18 @@ def mcts_run(
     ll = np.empty(82, dtype=np.uint64)
     lh = np.empty(82, dtype=np.uint64)
     stack = np.empty(MAX_PATH, dtype=np.int64)
+    ewb = np.empty(MAX_PATH, dtype=np.int64)  # ewb[t]: the edge into stack[t]
     ncap = nn.size
     ecap = emv.size
     c_puct = fp[FP_C_PUCT]
     fpu_c = fp[FP_FPU]
     lazy = 1 if ip[IP_EXPAND] >= 2 else 0
+    wdepth = ip[IP_WIDEN]
+    wvis = ip[IP_WIDEN_VISITS]
+    floor = fp[FP_FLOOR]
+    floor_p = fp[FP_FLOOR_PRIOR]
+    fdepth = ip[IP_FLOOR_DEPTH]
+    fwalls = ip[IP_FLOOR_WALLS] != 0
     status = ST_DONE
     it = 0
     while it < nsims:
@@ -1509,12 +1542,25 @@ def mcts_run(
                 _expand(node, m, hb, vb, cme, cop, wm, me, d_me, d_op, k,
                         pawns, fp, ip, mv, lg, order, ex, gains, walls, path, parent, queue,
                         seen, tmp, tmp2, rng, ne0, nne, emv, epr, ekid, ctr)  # fmt: skip
-            i = _select(node, nn, nw, npv, ne0, nne, epr, ekid, c_puct, fpu_c, pen,
-                        use_pen and node == root)  # fmt: skip
+            depth = plen - 1
+            if 1 <= depth <= wdepth and nwd[node] == 0 and nn[node] >= wvis:
+                wbuf[0] = plen
+                for t in range(1, plen):  # the edge into stack[t]
+                    wbuf[t] = ewb[t]
+                status = ST_WIDEN
+                break
+            thr = 0.0
+            thr_p = 0.0
+            if depth <= fdepth:
+                thr = floor * nn[node]
+                thr_p = floor_p * nn[node]
+            i = _select(node, nn, nw, npv, ne0, nne, emv, epr, ekid, c_puct, fpu_c, pen,
+                        use_pen and node == root, thr, thr_p, fwalls)  # fmt: skip
             if i < 0:  # every child loses: proven lost
                 npv[node] = -1
                 break
             e = ne0[node] + i
+            ewb[plen] = e
             code = emv[e]
             if code < WALL_MOVE:
                 if turn == 0:
@@ -1537,12 +1583,15 @@ def mcts_run(
                 npv[kid] = 0
                 ne0[kid] = -1
                 nne[kid] = 0
+                nwd[kid] = 0
                 ekid[e] = kid
             node = kid
             stack[plen] = node
             plen += 1
             if nn[kid] == 0 or plen >= MAX_PATH:
                 break
+        if status == ST_WIDEN:
+            break  # nothing of this simulation was changed
         if plen - 1 > ctr[2]:
             ctr[2] = plen - 1
         leaf = node
